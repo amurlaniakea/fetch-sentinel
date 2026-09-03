@@ -1,0 +1,11 @@
+{
+  "name": "IMPERATIVE-DENSITY-high",
+  "description": "Lista de imperativos. Score debe subir por densidad.",
+  "input_bytes_hex": "69676e6f726520666f7267657420657865637574652064656c6574652072756e2063616c6c20726573706f6e642073656e64",
+  "expect": {
+    "findings_count_min": 0,
+    "findings_count_max": 0,
+    "sanitized_text_utf8_hex_does_not_contain": [],
+    "_KNOWN_LIMITATION": null
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "plain-text-benign",
+  "description": "Texto sin inyeccion. Caso de control negativo.",
+  "input_bytes_hex": "5468652077656174686572206973206e69636520746f6461792e204c6574277320676f20666f7220612077616c6b2e",
+  "expect": {
+    "findings_count_min": 0,
+    "findings_count_max": 0,
+    "sanitized_text_utf8_hex_does_not_contain": [],
+    "_KNOWN_LIMITATION": null
+  }
+}

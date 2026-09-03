@@ -1,0 +1,15 @@
+[fetch]
+default_timeout_seconds = 10
+max_bytes = 5000000
+allowlist = []
+
+[paths]
+events_jsonl = "~/.local/share/fetch-sentinel/events.jsonl"
+keys_json = "~/.config/fetch-sentinel/keys.json"
+
+[witness]
+key_id_prefix = "fetch-sentinel"
+hmac_recommend_bytes = 32
+
+[citation]
+max_phrase_length = 500
