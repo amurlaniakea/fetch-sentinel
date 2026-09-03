@@ -397,3 +397,99 @@ def test_fetch_bytes_read_matches_body():
     opener = _FakeOpener(response=response)
     result = fetch("http://example.com/", _opener=opener)
     assert result.bytes_read == len(_html_to_bytes(html))
+
+
+# --------------------------------------------------------------------------- #
+# KI-9: final_url debe propagarse post-redirect (T44)
+# --------------------------------------------------------------------------- #
+
+
+def test_fetch_final_url_unchanged_when_no_redirect():
+    html = "<html><body><p>hi</p></body></html>"
+    response = _FakeResponse(_html_to_bytes(html), url="http://example.com/")
+    opener = _FakeOpener(response=response)
+    result = fetch("http://example.com/", _opener=opener)
+    assert result.final_url == "http://example.com/"
+    assert result.final_url == result.url
+
+
+def test_fetch_final_url_updated_after_redirect():
+    """Con redirect cross-origin DENTRO de allowlist, final_url debe
+    reflejar la URL post-redirect, no la original (KI-9, Spec §2.3)."""
+    import socket
+    from unittest.mock import patch
+    html = "<html><body><p>hi</p></body></html>"
+    response = _FakeResponse(
+        _html_to_bytes(html),
+        url="http://real-final.example/page",
+    )
+    opener = _FakeOpener(response=response)
+    # KI-7: mockear getaddrinfo para que no intente resolver DNS real.
+    with patch("core.fetcher.socket.getaddrinfo", return_value=[
+        (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0)),
+    ]):
+        result = fetch(
+            "http://original.example/start",
+            allowlist=["example"],
+            _opener=opener,
+        )
+    assert result.url == "http://original.example/start"
+    assert result.final_url == "http://real-final.example/page"
+    assert result.url != result.final_url
+
+
+# --------------------------------------------------------------------------- #
+# KI-7: SSRF — rechazo de IPs reservadas (T45)
+# --------------------------------------------------------------------------- #
+
+
+def test_fetch_blocked_loopback_127():
+    """Sin opener (real socket call). 127.0.0.1 debe bloquearse ANTES
+    de conectar."""
+    from core.fetcher import BlockedAddress
+    with pytest.raises(BlockedAddress) as exc_info:
+        fetch("http://127.0.0.1/", timeout=0.5)
+    assert exc_info.value.host == "127.0.0.1"
+    assert exc_info.value.reason == "loopback"
+
+
+def test_fetch_blocked_private_10():
+    """10.0.0.1 es rango privado (RFC 1918)."""
+    from core.fetcher import BlockedAddress
+    with pytest.raises(BlockedAddress) as exc_info:
+        fetch("http://10.0.0.1/", timeout=0.5)
+    assert exc_info.value.reason == "private"
+
+
+def test_fetch_blocked_link_local_169_254():
+    """169.254.x.x es link-local; cubre 169.254.169.254 (metadata de nube)."""
+    from core.fetcher import BlockedAddress
+    with pytest.raises(BlockedAddress) as exc_info:
+        fetch("http://169.254.169.254/latest/meta-data/", timeout=0.5)
+    assert exc_info.value.reason == "link_local"
+
+
+def test_fetch_blocked_unspecified_0_0_0_0():
+    """0.0.0.0 es unspecified."""
+    from core.fetcher import BlockedAddress
+    with pytest.raises(BlockedAddress) as exc_info:
+        fetch("http://0.0.0.0/", timeout=0.5)
+    assert exc_info.value.reason == "unspecified"
+
+
+def test_fetch_dns_resolves_to_blocked_raises():
+    """DNS rebinding: dominio que resuelve a IP privada debe bloquearse,
+    aunque el nombre no esté en allowlist de nombres sospechosos."""
+    import socket
+    from unittest.mock import patch
+
+    from core.fetcher import BlockedAddress
+
+    # Mock getaddrinfo para forzar resolución a 127.0.0.1.
+    with patch("core.fetcher.socket.getaddrinfo", return_value=[
+        (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 0)),
+    ]):
+        with pytest.raises(BlockedAddress) as exc_info:
+            fetch("http://suspicious-domain.example/", timeout=0.5)
+        assert exc_info.value.reason == "loopback"
+        assert exc_info.value.ip == "127.0.0.1"

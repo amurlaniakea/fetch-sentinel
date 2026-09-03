@@ -188,14 +188,36 @@ def _wrap_delimiters(
     suspicion: float,
     text: str,
 ) -> str:
-    """Produce el bloque con delimitadores estructurales."""
+    """Produce el bloque con delimitadores estructurales.
+
+    KI-8: el cuerpo se neutraliza contra las secuencias literales
+    `<fetched_content>` y `</fetched_content>` (y variantes case-insensitive),
+    sustituyendo el `<` inicial por `&lt;`. Esto evita que un payload
+    malicioso pueda:
+    1. cerrar el bloque real con un `</fetched_content>` propio,
+    2. abrir un bloque falso atribuible a otra URL con suspicion y sha256
+       manipulados.
+
+    El resto del cuerpo pasa tal cual (no se escapa completamente) para
+    mantener legibilidad del LLM downstream, como justifica Spec §3.4.
+    """
     url_escaped = saxutils.escape(url, {'"': "&quot;"})
+    # KI-8: neutralización case-insensitive de las etiquetas delimitadoras
+    # dentro del cuerpo. Solo escapamos el `<` cuando va seguido de
+    # 'fetched_content' o '/fetched_content'. Preservamos el case original.
+    body = text
+    body = re.sub(
+        r"<(/?)(fetched_content)\b",
+        lambda m: "&lt;" + m.group(1) + m.group(2),
+        body,
+        flags=re.IGNORECASE,
+    )
     return (
         f'<fetched_content url="{url_escaped}" '
         f'sha256="{sha256_post_sanitize}" '
         f'mode="{mode}" '
         f'suspicion="{suspicion:.3f}">\n'
-        f'{text}\n'
+        f'{body}\n'
         f'</fetched_content>'
     )
 

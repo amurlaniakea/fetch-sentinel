@@ -212,6 +212,49 @@ el fetcher — para eso está `sha256_html` en `FetchResult`).
   HTML. Si se escapara, perderíamos legibilidad del LLM y duplicaríamos
   trabajo de escapado en cada uso.
 
+#### §3.4.1 — KI-8: neutralización de auto-cierre dentro del cuerpo (T46)
+
+**Problema** (hallazgo de auditoría independiente, KI-8): el cuerpo
+del delimitador NO se escapa, lo que permite que un payload fetched
+contenga `</fetched_content>` propio para cerrar el bloque real, y
+luego inyectar un segundo bloque `<fetched_content ...>` falso
+atribuible a cualquier URL con `suspicion` y `sha256` manipulados.
+
+**Mitigación** (T46): dentro del cuerpo del delimitador, las
+secuencias literales `<fetched_content` y `</fetched_content` (y
+variantes case-insensitive) se neutralizan sustituyendo el `<`
+inicial por `&lt;`. El resto del cuerpo pasa tal cual.
+
+**Contrato actualizado**:
+
+- El cuerpo del delimitador contiene `&lt;fetched_content ...>` y/o
+  `&lt;/fetched_content>` literales si el input los contenía.
+- El delimitador externo sigue siendo `<fetched_content ...>...</fetched_content>`
+  exactamente como en §3.4.
+- Un parser que busca `<fetched_content ` (con `<` literal) encuentra
+  exactamente el delimitador externo y solo ese.
+
+**Implicación para consumidores downstream**: el cuerpo del delimitador
+es seguro de inyectar en un contexto donde el parser distingue `<`
+de `&lt;` (cualquier parser XML/HTML estándar). NO requiere pre-procesamiento.
+
+#### §3.4.2 — KI-7: rechazo de IPs reservadas antes de conectar (T45)
+
+`fetcher.py` resuelve el hostname de la URL (inicial o post-redirect)
+vía `socket.getaddrinfo()` y rechaza con `BlockedAddress` si la IP
+cae en alguno de estos rangos (siempre activo, independiente de
+`allowlist`):
+
+- `is_loopback`: 127.0.0.0/8, ::1.
+- `is_private`: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7.
+- `is_link_local`: 169.254.0.0/16, fe80::/10.
+- `is_reserved`: rangos reservados por IANA.
+- `is_multicast`: 224.0.0.0/4, ff00::/8.
+- `is_unspecified`: 0.0.0.0, ::
+
+La re-validación se repite tras cada redirect cross-host para
+prevenir DNS rebinding entre el allowlist match y la conexión.
+
 ### §3.5 Sanitización (reutilización de mcp-tool-sanitizer)
 
 ```python

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import hashlib
 import html.parser
+import ipaddress
+import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -67,6 +69,21 @@ class RedirectNotAllowed(FetchError):
         super().__init__(f"redirect from {from_url} to {to_url} not allowed")
         self.from_url = from_url
         self.to_url = to_url
+
+
+class BlockedAddress(FetchError):
+    """KI-7: la URL resuelve a una IP en un rango bloqueado.
+
+    Por defecto se bloquean: privadas, loopback, link-local, reserved,
+    multicast, unspecified. El bloqueo se aplica tanto a la URL inicial
+    como a cada URL post-redirect cross-host.
+    """
+
+    def __init__(self, host: str, ip: str, reason: str) -> None:
+        super().__init__(f"blocked {host} (resolves to {ip}): {reason}")
+        self.host = host
+        self.ip = ip
+        self.reason = reason
 
 
 class EmptyBody(FetchError):
@@ -201,6 +218,29 @@ class ReadabilityExtractor(html.parser.HTMLParser):
 # --------------------------------------------------------------------------- #
 
 
+class _HttpResult:
+    """Resultado interno de _HttpFetcher.fetch().
+
+    Incluye final_url para que el orquestador público pueda propagar
+    la URL post-redirección al FetchResult (KI-9: la Spec §2.3 exige
+    que url y final_url reflejen redirecciones).
+    """
+
+    def __init__(
+        self,
+        body: bytes,
+        content_type: str,
+        status_code: int,
+        final_url: str,
+        notes: list[str],
+    ) -> None:
+        self.body = body
+        self.content_type = content_type
+        self.status_code = status_code
+        self.final_url = final_url
+        self.notes = notes
+
+
 class _HttpFetcher:
     """Encapsula urllib.request.urlopen con timeout, max_bytes, redirect policy."""
 
@@ -218,14 +258,25 @@ class _HttpFetcher:
         # _opener es param de inyección para tests (mock de urllib).
         self._opener = _opener
 
-    def fetch(self, url: str) -> tuple[bytes, str, int, list[str]]:
-        """Devuelve (body_bytes, content_type, status_code, notes).
+    def fetch(self, url: str) -> _HttpResult:
+        """Devuelve _HttpResult(body, content_type, status, final_url, notes).
+
+        KI-7: valida la IP resuelta (rechaza rangos reservados) ANTES de
+        cualquier socket.connect(). Lo repite tras cada redirect cross-host.
 
         Raises:
             UnsupportedScheme, HTTPError, SizeExceeded, Timeout,
-            RedirectNotAllowed, UnsupportedContentType.
+            RedirectNotAllowed, UnsupportedContentType, BlockedAddress.
         """
         self._validate_scheme(url)
+
+        # KI-7: rechazar IPs en rangos reservados ANTES de conectar.
+        # Si el host es directamente una IP literal, urlparse la extrae.
+        # Si es hostname, getaddrinfo la resuelve y valida.
+        parsed_initial = urlparse(url)
+        host = parsed_initial.hostname
+        if host:
+            _resolve_and_validate_blocked(host)
 
         opener = self._opener if self._opener is not None else urllib.request.build_opener(
             _NoRedirectHandler()
@@ -257,6 +308,13 @@ class _HttpFetcher:
             # Validar redirect cross-origin si hay allowlist.
             if final_url != url:
                 self._validate_redirect(url, final_url)
+                # KI-7: tras redirect cross-host, re-validar la IP del
+                # nuevo host (puede haber DNS rebinding entre allowlist
+                # match por nombre y conexión real).
+                parsed_final = urlparse(final_url)
+                final_host = parsed_final.hostname
+                if final_host:
+                    _resolve_and_validate_blocked(final_host)
 
             # Validar content-type.
             if not content_type.lower().startswith("text/html"):
@@ -275,7 +333,13 @@ class _HttpFetcher:
                     raise SizeExceeded(self.max_bytes, len(body))
 
             notes: list[str] = []
-            return bytes(body), content_type, status_code, notes
+            return _HttpResult(
+                body=bytes(body),
+                content_type=content_type,
+                status_code=status_code,
+                final_url=final_url,
+                notes=notes,
+            )
         finally:
             try:
                 response.close()
@@ -335,6 +399,65 @@ def _match_host(host: str, pattern: str) -> bool:
     return host == pattern or host.endswith("." + pattern)
 
 
+def _ip_is_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
+    """Devuelve la razón del bloqueo, o None si la IP es pública.
+
+    KI-7: bloquea por defecto privadas, loopback, link-local, reserved,
+    multicast, unspecified. Esto se aplica SIEMPRE, incluso con allowlist
+    vacía o None — la allowlist añade hosts permitidos, no relaja el
+    bloqueo de rangos reservados.
+
+    Orden de checks: el más específico gana. `is_link_local` se evalúa
+    ANTES que `is_private` porque Python 3.12 reporta `is_private=True`
+    para 169.254.0.0/16 también (overlap con link-local), pero queremos
+    reportar `link_local` específicamente porque es el caso de metadata
+    de nube (169.254.169.254), que es el vector SSRF por excelencia.
+    """
+    if ip.is_loopback:
+        return "loopback"
+    if ip.is_link_local:
+        return "link_local"
+    if ip.is_unspecified:
+        return "unspecified"
+    if ip.is_multicast:
+        return "multicast"
+    if ip.is_reserved:
+        return "reserved"
+    if ip.is_private:
+        return "private"
+    return None
+
+
+def _resolve_and_validate_blocked(host: str) -> str:
+    """Resuelve `host` y rechaza si la IP es de un rango bloqueado.
+
+    KI-7 + protección contra DNS rebinding. Devuelve la IP resuelta (la
+    primera de getaddrinfo) si es pública. Lanza BlockedAddress si la
+    IP cae en algún rango reservado.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise FetchError(f"could not resolve {host}: {e}") from e
+
+    for info in infos:
+        # info[4] es sockaddr: tuple[str, int] (IPv4) o
+        # tuple[str, int, int, int] (IPv6). El primer elemento es la IP.
+        sockaddr = info[4]
+        ip_str = str(sockaddr[0])
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        reason = _ip_is_blocked(ip)
+        if reason is not None:
+            raise BlockedAddress(host=host, ip=ip_str, reason=reason)
+        return ip_str
+    # Si getaddrinfo devuelve tuplas sin IP parseable, fallback al primer
+    # sockaddr (no debería pasar, pero por seguridad).
+    return str(infos[0][4][0])
+
+
 # --------------------------------------------------------------------------- #
 # Allowlist helper (Spec §2.2)
 # --------------------------------------------------------------------------- #
@@ -391,7 +514,11 @@ def fetch(
         _opener=_opener,
     )
 
-    body_bytes, content_type, status_code, http_notes = http.fetch(url)
+    http_result = http.fetch(url)
+    body_bytes = http_result.body
+    content_type = http_result.content_type
+    status_code = http_result.status_code
+    http_notes = http_result.notes
 
     sha256_html = hashlib.sha256(body_bytes).hexdigest()
 
@@ -410,7 +537,9 @@ def fetch(
 
     sha256_text = hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    final_url = url  # _HttpFetcher podría exponer final_url si lo extendemos
+    # KI-9: la Spec §2.3 exige que final_url refleje la URL
+    # post-redirección, no la URL original de input.
+    final_url = http_result.final_url
 
     return FetchResult(
         url=url,

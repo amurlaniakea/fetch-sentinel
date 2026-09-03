@@ -398,6 +398,110 @@ Limitations (KI-1, KI-2), License (link a LICENSE).
 
 ---
 
+## Fase 9 — Fixes post-auditoría independiente (2026-09-03, KI-7/KI-8/KI-9)
+
+Tres hallazgos del auditor externo (Claude) sobre el commit inicial
+publicado en https://github.com/amurlaniakea/fetch-sentinel. Los
+detalles completos están en `sdd/KNOWN_ISSUES.md` (KI-7, KI-8, KI-9).
+
+### T44 — `final_url` se propaga desde `_HttpFetcher` al `FetchResult` (KI-9)
+
+**Qué**: una sola línea de cambio en `core/fetcher.py`. La función
+`_HttpFetcher.fetch()` ya calcula `final_url` (línea 251: `final_url =
+response.geturl()`); solo hay que añadirlo al valor de retorno (un
+dict, una dataclass, o argumentos adicionales), y el orquestador
+público debe usarlo en lugar de reasignar con la URL original.
+
+**Tests** (`tests/test_fetcher.py`):
+- `test_fetch_final_url_updated_after_redirect` — opener simulado que
+  hace redirect cross-origin dentro de allowlist; assert
+  `result.final_url` == URL post-redirect, NO la URL original.
+- `test_fetch_final_url_unchanged_when_no_redirect` — opener que NO
+  redirige; assert `final_url == url`.
+- `test_fetch_result_url_field_equals_final_url` — sin redirect;
+  ambos campos iguales (consistente).
+
+**Done cuando**: los 3 tests pasan + `result.final_url != result.url`
+es FALSO sin redirect y VERDADERO con redirect.
+
+### T45 — SSRF: rechazo de IPs privadas/loopback/link-local/reserved, DNS resolution (KI-7)
+
+**Qué**: en `core/fetcher.py`, antes de aceptar una URL (inicial o
+post-redirect), resolver el hostname con `socket.getaddrinfo()` y
+rechazar con `FetchError.BlockedAddress` si la IP cae en algún rango
+reservado. Bloquea por defecto: `is_private`, `is_loopback`,
+`is_link_local`, `is_reserved`, `is_multicast`, `is_unspecified`. Esto
+debe aplicarse también tras cada redirect cross-host (ya validado por
+allowlist) por si el nuevo host apunta a IP privada.
+
+**Decisión de gobernanza pendiente de Pedro** (no resuelta
+autónomamente):
+- `allowlist=[]` debe seguir significando "sin restricción de hostname"
+  pero con **bloqueo de rangos privados** por defecto (mi
+  recomendación), O
+- `allowlist=[]` debe significar "todo bloqueado" (más conservador, pero
+  rompe el uso actual de `fetch-sentinel` para cualquiera que no haya
+  configurado allowlist explícitamente).
+
+Por defecto en este fix: **bloqueo de rangos privados SIEMPRE activo**,
+incluso con `allowlist=[]` o `allowlist=None`. La allowlist sigue
+sirviendo para añadir hosts permitidos sobre la base restringida.
+
+**Tests** (`tests/test_fetcher.py`):
+- `test_fetch_blocked_loopback_127_0_0_1` — request a
+  `http://127.0.0.1/whatever` → `BlockedAddress`.
+- `test_fetch_blocked_private_10_0_0_1` — request a
+  `http://10.0.0.1/` → `BlockedAddress`.
+- `test_fetch_blocked_link_local_169_254_169_254` — metadata de nube →
+  `BlockedAddress`.
+- `test_fetch_blocked_unspecified_0_0_0_0` → `BlockedAddress`.
+- `test_fetch_allowed_public_when_in_allowlist` — IP pública + allowlist
+  match → OK.
+- `test_fetch_dns_rebind_blocked` — dominio que resuelve a IP privada,
+  aunque esté en allowlist por nombre → `BlockedAddress`. (Puede
+  requerir mock de `socket.getaddrinfo`.)
+
+**Done cuando**: los tests pasan + el rechazo ocurre ANTES de hacer
+ningún `socket.connect()` al destino bloqueado.
+
+### T46 — Delimitador a prueba de auto-cierre (KI-8)
+
+**Qué**: en `core/structural_guard._wrap_delimiters`, neutralizar las
+secuencias literales `<fetched_content` y `</fetched_content>` dentro
+del cuerpo del texto, para que un payload malicioso no pueda:
+1. cerrar el bloque real con `</fetched_content>` propio,
+2. abrir un bloque falso atribuible a cualquier URL con `suspicion`
+   manipulada.
+
+**Decisión de implementación**: la opción más simple y robusta es
+escapar solo las **secuencias literales** `&lt;fetched_content` /
+`&lt;/fetched_content` en el cuerpo (sustituyendo `<` por `&lt;`
+únicamente cuando va seguido de `fetched_content` o `/fetched_content`).
+NO escapar el cuerpo completo (mantiene legibilidad, justifica Spec
+§3.4).
+
+**Contrato actualizado** (modifica Spec §3.4): el cuerpo del delimitador
+está neutralizado contra las secuencias `<fetched_content>` y
+`</fetched_content>` literales. El resto del texto pasa tal cual. Esto
+**sí es un cambio al contrato** de Spec, por lo que requiere update
+explícito de Spec §3.4 + commit que lo justifique.
+
+**Tests** (`tests/test_structural_guard.py` + corpus):
+- `test_delimiters_body_escapes_fake_close_tag` — input contiene
+  `</fetched_content>` literal → el delimitador de salida tiene
+  `&lt;/fetched_content>` (NO cierra).
+- `test_delimiters_body_escapes_fake_open_tag` — input contiene
+  `<fetched_content>` literal → tiene `&lt;fetched_content>`.
+- `test_delimiters_body_escapes_uppercase_variant` — `<FETCHED_CONTENT>`
+  también cuenta (case-insensitive).
+- `test_corpus_known_limitation_auto_close` — caso en el corpus con
+  el payload que reprodujo el auditor.
+
+**Done cuando**: los tests pasan + `sdd/spec.md` §3.4 actualizado +
+regex/parse del delimitador confirma que sigue siendo well-formed.
+
+---
+
 ## §Cambios a este Task list
 
 Cualquier desviación requiere:
