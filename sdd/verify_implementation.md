@@ -228,7 +228,131 @@ $ sha256sum core/*.py main.py pyproject.toml AGENTS.md README.md config.toml
 (Estos hashes los pego en el commit final para que el auditor pueda
 verificar que el contenido en disco coincide con lo commiteado.)
 
-## §7. Lo que falta (TODO honesto)
+## §8. Aplicación de la skill `github-licencia` (post-implementación)
+
+Después de la implementación inicial (`73b711f`), aplico la skill
+`github-licencia` al repo local. **Hallazgos críticos que se
+arreglaron**:
+
+### 8.1 LICENSE no era verbatim de gnu.org
+
+**Bug**: el LICENSE commiteado en `8956456` tenía 401 líneas y NO era
+idéntico al texto oficial de gnu.org. Era una versión re-escrita con
+cambios en puntuación, redacción y secciones completas faltantes.
+**Peor**: terminaba con una cabecera personalizada
+`Copyright (C) 2026 Pedro Sordo Martínez` — exactamente el antipatrón
+que la skill `github-licencia` advierte como "modificar el documento".
+
+**Detección**: descarga de
+`https://www.gnu.org/licenses/agpl-3.0.txt` (661 líneas) + `diff`
+contra LICENSE local + `sha256sum`. Diff NO vacío con cambios
+masivos.
+
+**Fix**: reemplazar LICENSE con el archivo descargado de gnu.org.
+Hash del archivo en disco tras el fix:
+`0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0`.
+Este hash coincide con el de referencia citado en la skill.
+
+**Verificación**:
+```
+$ wc -l LICENSE
+661 LICENSE
+$ sha256sum LICENSE
+0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0  LICENSE
+$ diff /tmp/agpl-official.txt LICENSE && echo IDENTICO
+IDENTICO
+$ grep -c 'any later version' LICENSE
+3
+```
+
+### 8.2 SPDX faltante en `_generate_corpus.py`
+
+**Bug**: el script generador del corpus (`tests/fuzz_injection_corpus/
+_generate_corpus.py`) no tenía cabecera SPDX. Todos los demás `.py`
+sí la tenían.
+
+**Detección**: bucle sobre `git ls-files '*.py'` con `head -5 $f |
+grep SPDX-License-Identifier`. Resultado: 1 archivo MISSING.
+
+**Fix**: añadir las dos líneas SPDX estándar.
+
+**Verificación**:
+```
+$ for f in $(git ls-files '*.py'); do
+>   head -5 "$f" | grep -q 'SPDX-License-Identifier' || echo "MISSING: $f"
+> done
+(salida vacía = todos los .py tienen SPDX)
+```
+
+### 8.3 pyproject.toml: formato legacy → PEP 639
+
+**Bug**: `license = { text = "AGPL-3.0-or-later" }` (formato legacy).
+La skill recomienda el formato moderno PEP 639: `license = "AGPL-3.0-
+or-later"` (string plano).
+
+**Fix**: una línea. Verificado parseando con `tomllib`.
+
+### 8.4 Lo que la skill describe pero NO se aplicó (fuera de alcance)
+
+Los pasos 4-7 de la skill (`gh api .../topics`, default branch,
+`gh repo create`, `gh pr create`, push) **no se aplican todavía**
+porque el repo sigue sin remoto. La aplicación de la skill fue
+estrictamente local, con comandos verificables por el auditor.
+
+Cuando el auditor externo apruebe el push a GitHub, se ejecutan los
+pasos restantes:
+
+```bash
+cd /home/sil/fetch-sentinel
+gh repo create amurlaniakea/fetch-sentinel --public --source=. \
+    --description "Guardian en tiempo de fetch para agentes autonomos: defensa estructural contra inyeccion de prompts en contenido web." \
+    --remote origin
+# Push directo: el repo es NUEVO, no hay ramas previas que proteger.
+git push -u origin main
+# Topics (formato lowercase, sin puntos):
+gh api -X PUT repos/amurlaniakea/fetch-sentinel/topics \
+    -f names[]=security \
+    -f names[]=prompt-injection \
+    -f names[]=agent-security \
+    -f names[]=web-fetch \
+    -f names[]=llm \
+    -f names[]=agpl
+# Verificación en remoto (no fiarse de self-report):
+BRANCH=$(gh repo view amurlaniakea/fetch-sentinel \
+    --json defaultBranchRef --jq '.defaultBranchRef.name')
+curl -sS "https://raw.githubusercontent.com/amurlaniakea/fetch-sentinel/$BRANCH/LICENSE" \
+    -o /tmp/remote-license.txt
+diff /tmp/agpl-official.txt /tmp/remote-license.txt
+# (Pitfall conocido: raw.githubusercontent.com reescribe ancho de línea,
+# por lo que el diff puede mostrar SOLO wrapping, no cambios de texto.
+# Si pasa, verificar también con tr -d ' \n' | sha256sum y comparar.)
+```
+
+Estos pasos quedan en este verify para que el auditor los ejecute
+cuando apruebe el push. **No se ejecutan ahora.**
+
+### 8.5 Red-team note sobre este fix
+
+**Por qué se coló el LICENSE malo en el commit `8956456`**:
+
+- En la Constitución §9 se documentó que el LICENSE sería "AGPL-3.0-or-
+  later (texto íntegro de gnu.org en `LICENSE`)". El agente (Hermes)
+  interpretó "texto íntegro" como "escribir el texto" en vez de "copiar
+  el texto verbatim de gnu.org".
+- La Constitución no incluía un AC explícito del tipo "LICENSE debe
+  ser byte-idéntico a `https://www.gnu.org/licenses/agpl-3.0.txt`".
+- La verificación independiente del auditor (Claude, vía Pedro) no
+  alcanzó a ejecutarse porque el push no salió. Si hubiera salido, el
+  primer `gh pr create` contra el repo recién creado habría mostrado
+  el LICENSE y el auditor lo habría cazado en revisión.
+
+**Lección para futuras Constituciones**: añadir AC explícito
+"hash SHA-256 del archivo LICENSE en disco == hash SHA-256 de
+`https://www.gnu.org/licenses/agpl-3.0.txt`" en §6.1 (evidencia
+mínima). Esto hace que el agente NO PUEDA saltarse el verbatim sin
+que pytest/CI lo detecte.
+
+## §9. Lo que falta (TODO honesto)
 
 - **TODO-C3-1**: `assert_safe_environment` debería rechazar HOME bajo
   `/tmp` o `/var` (no solo exigir que exista). Pendiente para Fase 2.
@@ -236,17 +360,22 @@ verificar que el contenido en disco coincide con lo commiteado.)
   externo, NO está implementada como comando. Pendiente para Fase 2.
 - **TODO-spec-1**: el formato de delimitadores es byte-a-byte en la
   Spec, pero no hay un test que verifique TODOS los atributos. Pendiente.
+- **TODO-CONST-1** (nuevo, de §8.5): añadir AC en Constitución §6.1:
+  "LICENSE debe ser byte-idéntico a
+  `https://www.gnu.org/licenses/agpl-3.0.txt` (hash
+  `0d96a4ff...079abcb0`)". Evita que vuelva a colarse un LICENSE
+  re-escrito en commits futuros.
 
-## §9. Estado del repo
+## §10. Estado del repo
 
 ```
 .git/                          # init local, sin remoto
 .gitignore                     # completo (.venv/, credentials, etc.)
-LICENSE                        # AGPL-3.0-or-later
+LICENSE                        # AGPL-3.0-or-later (verbatim gnu.org, 661 lineas)
 AGENTS.md                      # gobernanza para Hermes
 README.md                      # documentación usuario
 config.toml                    # paths y límites
-pyproject.toml                 # atribución + deps
+pyproject.toml                 # atribución + deps (PEP 639 license)
 main.py                        # CLI
 core/                          # 6 módulos + __init__ + exceptions
 tests/                         # 6 archivos + corpus/
@@ -254,8 +383,8 @@ sdd/                           # constitución, spec, plan, tasks, spike, KNOWN_
 .venv/                         # NO COMMITEADO (gitignored)
 ```
 
-Working tree tiene cambios sin commit (este verify + varios archivos).
-El commit final se hace en el siguiente paso.
+Working tree limpio (último commit `1494754`). Sin push a GitHub.
+Sin repo remoto creado. Estado congelado, esperando auditor externo.
 
 ---
 
