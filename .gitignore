@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+*.egg
+.installed.cfg
+*.egg-info
+MANIFEST
+
+# Venvs (no commitear NUNCA — confirmado en scope-lib K2 2026-07-19)
+.venv/
+venv/
+env/
+ENV/
+
+# Tests / coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.cache
+tests/output/
+tests/fixtures/sandbox-tmp/
+
+# Spike artifacts (locales, no parte del repo)
+/tmp/spike/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Credenciales y estado runtime de fetch-sentinel
+# (creados por el daemon en uso, NUNCA commitearlos)
+*.key
+*.key.json
+keys.json
+inbox.jsonl
+events.jsonl
+*.local.toml
+
+# OS
+Thumbs.db
