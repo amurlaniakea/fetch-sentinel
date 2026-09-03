@@ -181,43 +181,56 @@ def _compute_suspicion(text: str) -> tuple[float, list[str]]:
 # --------------------------------------------------------------------------- #
 
 
+def _neutralize_delimiters(text: str) -> str:
+    """Neutraliza las etiquetas delimitadoras literales en el cuerpo.
+
+    KI-8 (original): cualquier `<fetched_content` o `</fetched_content`
+    literal en el cuerpo se escapa a `&lt;fetched_content` /
+    `&lt;/fetched_content`, para que el payload fetched no pueda
+    inyectar un segundo bloque falso.
+
+    KI-13 (bypass): el regex tolera runs de whitespace entre `<`, `/` y
+    `fetched_content`. Cubre `< fetched_content>`, `< /fetched_content>`,
+    `<\t/fetched_content>`, etc. — todos los formatos que un LLM
+    downstream leería como visualmente idénticos al delimitador real.
+
+    Preserva el case original del token `fetched_content` para que la
+    neutralización round-trippe bien si se deserializa.
+    """
+    # Tolerar whitespace opcional entre <, / y 'fetched_content'.
+    # Case-insensitive en todo el match.
+    return re.sub(
+        r"<\s*(/?)\s*(fetched_content)\b",
+        lambda m: "&lt;" + m.group(1) + m.group(2),
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
 def _wrap_delimiters(
     url: str,
     sha256_post_sanitize: str,
     mode: SanitizeMode,
     suspicion: float,
-    text: str,
+    body_neutralized: str,
 ) -> str:
     """Produce el bloque con delimitadores estructurales.
 
-    KI-8: el cuerpo se neutraliza contra las secuencias literales
-    `<fetched_content>` y `</fetched_content>` (y variantes case-insensitive),
-    sustituyendo el `<` inicial por `&lt;`. Esto evita que un payload
-    malicioso pueda:
-    1. cerrar el bloque real con un `</fetched_content>` propio,
-    2. abrir un bloque falso atribuible a otra URL con suspicion y sha256
-       manipulados.
+    Args:
+        body_neutralized: el cuerpo YA neutralizado (post-KI-8/KI-13).
+            El hash pasado en `sha256_post_sanitize` debe ser el de este
+            cuerpo, NO del texto pre-neutralización (KI-12).
 
-    El resto del cuerpo pasa tal cual (no se escapa completamente) para
-    mantener legibilidad del LLM downstream, como justifica Spec §3.4.
+    El resto del cuerpo pasa tal cual al delimitador — Spec §3.4 justifica
+    la no-escapación completa por legibilidad del LLM downstream.
     """
     url_escaped = saxutils.escape(url, {'"': "&quot;"})
-    # KI-8: neutralización case-insensitive de las etiquetas delimitadoras
-    # dentro del cuerpo. Solo escapamos el `<` cuando va seguido de
-    # 'fetched_content' o '/fetched_content'. Preservamos el case original.
-    body = text
-    body = re.sub(
-        r"<(/?)(fetched_content)\b",
-        lambda m: "&lt;" + m.group(1) + m.group(2),
-        body,
-        flags=re.IGNORECASE,
-    )
     return (
         f'<fetched_content url="{url_escaped}" '
         f'sha256="{sha256_post_sanitize}" '
         f'mode="{mode}" '
         f'suspicion="{suspicion:.3f}">\n'
-        f'{body}\n'
+        f'{body_neutralized}\n'
         f'</fetched_content>'
     )
 
@@ -257,15 +270,25 @@ def sanitize(
     clean, findings_count = _sanitize(text, mode)
     sanitization_applied = (clean != text)
 
-    sha256_post_sanitize = hashlib.sha256(clean.encode("utf-8")).hexdigest()
+    # KI-12: reordenar para que la neutralización de KI-8/KI-13 ocurra
+    # ANTES del hash. El hash publicado en el delimitador DEBE cubrir los
+    # bytes reales que el LLM downstream va a leer (el cuerpo
+    # neutralizado), no el texto pre-neutralización.
+    body_neutralized = _neutralize_delimiters(clean)
+
+    sha256_post_sanitize = hashlib.sha256(
+        body_neutralized.encode("utf-8")
+    ).hexdigest()
 
     if include_suspicion_score:
-        # Score sobre el texto POST-SANITIZE: es lo que el LLM downstream
-        # va a leer realmente. Si lo computáramos sobre el original, un
-        # atacante con un TAG block evade la heurística trivialmente
-        # (parte la palabra "ignore" en "igno"+TAG+"re" → \b ignore \b no
-        # matchea). Verificar en disco: spike_report.md demuestra este
-        # patrón.
+        # Score sobre el texto POST-SANITIZE (clean): es lo que el LLM
+        # downstream va a leer realmente (más la neutralización del
+        # delimitador, que es transformación puramente sintáctica sin
+        # impacto en la semántica). Si lo computáramos sobre el
+        # original, un atacante con un TAG block evade la heurística
+        # trivialmente (parte la palabra "ignore" en "igno"+TAG+"re"
+        # → \b ignore \b no matchea). Verificar en disco:
+        # spike_report.md demuestra este patrón.
         score, signals = _compute_suspicion(clean)
     else:
         score, signals = 0.0, []
@@ -275,13 +298,16 @@ def sanitize(
         sha256_post_sanitize=sha256_post_sanitize,
         mode=mode,
         suspicion=score,
-        text=clean,
+        body_neutralized=body_neutralized,
     )
 
     return GuardResult(
         url=url,
         mode=mode,
-        sanitized_text=clean,
+        # KI-12: sanitized_text pasa a ser el texto NEUTRALIZADO (lo que
+        # va al delimitador y al witness). clean pre-neutralización se
+        # mantiene accesible vía hash para verificación de integridad.
+        sanitized_text=body_neutralized,
         sha256_post_sanitize=sha256_post_sanitize,
         delimited_text=delimited,
         suspicion_score=score,

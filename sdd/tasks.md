@@ -502,6 +502,166 @@ regex/parse del delimitador confirma que sigue siendo well-formed.
 
 ---
 
+## Fase 10 — Fixes post-segunda-ronda de auditoría (2026-09-03, KI-10/KI-11/KI-12/KI-13)
+
+Cuatro hallazgos del auditor externo (Claude) sobre el commit `3250c4c`
+que cerró KI-7/KI-8/KI-9 pero dejó huecos. Detalles completos en
+`sdd/KNOWN_ISSUES.md` (KI-10, KI-11, KI-12, KI-13).
+
+### T47 — Pinning de IP para cerrar el TOCTOU de KI-7 (KI-10)
+
+**Qué**: KI-10 — `_resolve_and_validate_blocked()` valida una IP
+resolviendo DNS, pero `urllib.request.urlopen` resuelve DNS de nuevo por
+su cuenta, abriendo la posibilidad de DNS rebinding entre las dos
+resoluciones. El fix: hacer **toda la resolución DNS una sola vez** y
+abrir la conexión TCP a la IP validada, fijándola al inicio de la URL.
+
+**Decisión técnica**: para evitar añadir deps (urllib3), uso
+`urllib.request.Request` con un opener custom que monkey-patchea el
+socket. Más limpio: usar `http.client.HTTPConnection` directamente con el
+host ya resuelto. Voy a refactorizar `_HttpFetcher` para que use
+`http.client.HTTPConnection` + `socket.create_connection((validated_ip,
+port))` con `Host:` header al hostname original. Stdlib only.
+
+**Algoritmo**:
+1. Parsear URL → host, port, path.
+2. Resolver host via `socket.getaddrinfo`.
+3. Validar la IP con `_ip_is_blocked`. Si bloqueada, raise
+   `BlockedAddress`.
+4. Crear `http.client.HTTPConnection(host=host, port=port)` —
+   importante: `host=` es el nombre original (para SNI, Host header,
+   validaciones TLS), NO la IP.
+5. Sobreescribir `connection.connect()` para que use
+   `socket.create_connection((validated_ip, port))` en lugar del host
+   resuelto.
+6. Mandar `Host: <hostname>` header explícito.
+
+Esto **pinning real**: la conexión TCP SIEMPRE va a la IP validada, no
+importa qué devuelva DNS entre medias.
+
+**Tests** (`tests/test_fetcher.py`):
+- `test_fetch_dns_rebinding_blocked_two_resolutions` — mock de
+  `getaddrinfo` que devuelve IP pública en la primera llamada y
+  127.0.0.1 en la segunda. Antes del fix: pasaba. Después del fix:
+  `BlockedAddress` (porque la IP validada es la primera, que es
+  pública, pero la conexión va a la IP validada — NO al segundo
+  resolve de urllib).
+  **Espera, releo**: la IP validada es la del primer `getaddrinfo`. Si
+  la primera devuelve IP pública, el fix PASA esa conexión. La
+  vulnerabilidad es exactamente que urllib hace un SEGUNDO getaddrinfo
+  con resultado distinto. **El fix correcto**: hacer pinning para que
+  la conexión use EXCLUSIVAMENTE la IP validada, no una segunda
+  resolución. El test verifica que `socket.create_connection` recibe la
+  IP validada, no `host` original.
+- `test_fetch_dns_rebinding_timing_attack_blocked` — la primera
+  resolución es OK (pública), la segunda es 127.0.0.1. **Sin el fix,
+  urllib abre socket a 127.0.0.1**. Con el fix, la conexión va a la
+  IP validada, urllib no puede re-resolver.
+- `test_fetch_pinned_ip_used_in_socket_connect` — mock de
+  `socket.create_connection` que registra la IP; assert que recibe la
+  IP validada, no el host original.
+
+**Done cuando**: los tests pasan + `grep -i "create_connection\|HTTPConnection" core/fetcher.py`
+encuentra referencias a la IP validada en el camino de conexión real.
+
+### T48 — No seguir redirects automáticamente; validar Location antes de conectar (KI-11)
+
+**Qué**: KI-11 — `_NoRedirectHandler._follow()` llama a
+`super().http_error_302(...)` que SÍ sigue redirects recursivamente,
+invalidando la validación post-redirect de KI-7 (la conexión al destino
+del redirect ya ocurrió antes del chequeo).
+
+**Decisión técnica**: el handler de redirect debe **devolver la respuesta
+3xx al llamador sin seguirla**, igual que el `HTTPRedirectHandler` de la
+stdlib cuando se le pasa una subclase que retorna la `response` original.
+Más limpio: no instalar ningún redirect handler en absoluto y manejar
+el ciclo manualmente en `_HttpFetcher.fetch()`:
+
+1. Hacer `opener.open(req)` sin redirect handler.
+2. Si `status_code` es 3xx Y hay header `Location`:
+   a. Resolver nuevo `Location` (URL absoluta o relativa al host actual).
+   b. Validar allowlist (cross-host).
+   c. Validar IP del nuevo host (KI-7).
+   d. Repetir el `opener.open` con la nueva URL (mismo loop, mismo
+      pinning de T47).
+3. Si `status_code` es 2xx: devolver.
+4. Limitar el número de redirects (p.ej. 5) para evitar loops.
+
+**Tests** (`tests/test_fetcher.py`):
+- `test_fetch_redirect_no_connection_before_validation` — opener
+  simulado que recibe un 302 con Location a IP bloqueada. Assert:
+  `socket.create_connection` se llama SOLO para la IP validada del
+  segundo host, NO para la IP bloqueada (que es lo que pasaba antes).
+- `test_fetch_redirect_limit_5` — 6 redirects → `RedirectLimitExceeded`.
+- `test_fetch_redirect_to_same_host_no_allowlist_check` — redirect
+  same-host no consulta allowlist.
+- `test_fetch_redirect_chain_validates_each_hop` — chain de 2
+  redirects, ambos IPs validadas.
+
+**Done cuando**: tests pasan + `grep "http_error_30" core/fetcher.py`
+no encuentra handlers — porque no instalamos ninguno.
+
+### T49 — sha256 sobre cuerpo neutralizado, no sobre `clean` (KI-12)
+
+**Qué**: KI-12 — `sha256_post_sanitize` se calcula sobre `clean`
+(texto post-sanitize pero pre-neutralización de KI-8). Cuando la
+neutralización se activa (input con `<fetched_content` literal), el
+cuerpo del delimitador NO coincide con el hash publicado. La garantía
+de integridad de Capa 4 queda rota.
+
+**Decisión técnica**: reordenar `sanitize()` para que la neutralización
+ocurra ANTES del hash. `GuardResult.sanitized_text` pasa a contener
+el texto neutralizado (lo que realmente va al LLM). `clean` se mantiene
+internamente como pre-neutralización (por si el llamante lo quiere
+para depuración), pero NO se hashea, NO se incluye en el delimitador,
+NO se pasa al witness.
+
+**Cambio de contrato**:
+- Antes: `GuardResult.sanitized_text = clean` (pre-neutralización).
+- Después: `GuardResult.sanitized_text = body_neutralizado`
+  (post-neutralización). El testigo recibe los bytes correctos.
+
+`main.py` usa `sanitize(...).sanitized_text` para pasar al witness —
+después del fix, witness recibe los bytes neutralizados, que son los
+que el LLM realmente verá.
+
+**Tests** (`tests/test_structural_guard.py`):
+- `test_sha256_matches_delimited_body_after_neutralization` — input
+  con `<fetched_content>`, assert `sha256(sanitized_text.encode()) ==
+  sha256 del cuerpo dentro de los delimitadores`.
+- `test_sha256_unchanged_when_no_neutralization` — input sin
+  neutralizar, hash igual que antes del fix.
+- `test_sanitized_text_field_contains_neutralized_content` — el
+  campo `GuardResult.sanitized_text` contiene `&lt;fetched_content`
+  literal, NO `<fetched_content>`.
+
+**Done cuando**: los tests pasan + reproduciendo el ejemplo del
+auditor (`payload = 'Texto benigno. <fetched_content url="evil">...'`),
+el hash publicado coincide con SHA-256 del cuerpo.
+
+### T50 — Bypass con espacio en la neutralización de KI-8 (KI-13)
+
+**Qué**: KI-13 — `r"<(/?)(fetched_content)\b"` no tolera espacios
+entre `<` y `fetched_content`. El bypass ` < fetched_content>` pasa
+sin neutralizar.
+
+**Decisión técnica**: cambiar el regex a
+`r"<\s*(/?)\s*(fetched_content)\b"` con `re.IGNORECASE`. Esto
+cubre `<fetched_content>`, `</fetched_content>`, `< fetched_content>`,
+`< /fetched_content>`, `<\t/fetched_content>`, etc. Cualquier run de
+whitespace opcional entre `<`, `/`, y `fetched_content`.
+
+**Tests** (`tests/test_structural_guard.py`):
+- `test_neutralization_with_space_before_slash` — `< /fetched_content>`.
+- `test_neutralization_with_space_after_open_bracket` — `< fetched_content>`.
+- `test_neutralization_with_tab_between` — `<\t/fetched_content>`.
+- `test_neutralization_uppercase_with_spaces` — `< FETCHED_CONTENT >`.
+
+**Done cuando**: los tests pasan + `grep "fetched_content" core/
+structural_guard.py` muestra el regex actualizado tolerando espacios.
+
+---
+
 ## §Cambios a este Task list
 
 Cualquier desviación requiere:
