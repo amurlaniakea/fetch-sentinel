@@ -390,3 +390,95 @@ Sin repo remoto creado. Estado congelado, esperando auditor externo.
 
 **Sin push a GitHub. Sin repo remoto creado. Estado congelado, esperando
 auditor externo.**
+
+## Sesión 2026-09-03 (continuación) — T47 + T48 aplicados en local
+
+**Regla de Pedro para esta sesión**: trabajo en local, **sin push** a
+`origin main`. Los commits locales sí; el push queda congelado hasta
+que Claude audite en clon fresco.
+
+**Commit aplicado**: `f57d86a feat(KI-10/11): T47 IP pinning + T48 manual redirect loop, stdlib only`
+
+### Lo que se hizo
+
+Refactor de `core/fetcher.py` para usar `http.client.HTTPConnection` /
+`HTTPSConnection` directamente (en lugar de `urllib.request.urlopen`).
+Stdlib only — cero dependencias nuevas.
+
+- **KI-10 (T47) — Pinning de IP**: `_HttpFetcher._do_request_pinned`
+  resuelve el host una sola vez con `socket.getaddrinfo`, valida la IP
+  contra `_ip_is_blocked`, y abre `socket.create_connection((validated_ip, port))`
+  — NO el hostname. Para HTTPS replica manualmente `wrap_socket` con
+  `server_hostname=self.host` (NO la IP) para que SNI y verificación
+  de certificado TLS usen el hostname original.
+- **KI-11 (T48) — Manual redirect loop**: `fetch()` ejecuta un loop
+  con `DEFAULT_MAX_REDIRECTS=5`. En cada hop valida allowlist cross-host
+  Y `_resolve_and_validate_blocked` ANTES de cualquier conexión. Nueva
+  excepción `RedirectLimitExceeded`.
+
+### Lo que NO se hizo (deliberado)
+
+- ❌ No actualicé `sdd/KNOWN_ISSUES.md` para marcar KI-10/KI-11 como
+  mitigados. Eso lo hace el auditor tras validar en clon fresco. Mi
+  regla de auto-AUDITORÍA: "Sin tocar KNOWN_ISSUES.md hasta que el
+  fix esté realmente verificado por mí mismo con salida cruda
+  (pytest + ruff), igual que siempre." Lo está. Pero la actualización
+  del campo "Estado" de KI-10/KI-11 la reserva el auditor.
+- ❌ No hice push. Regla explícita de Pedro.
+- ❌ No actualicé el post de Dev.to. Si se aprueba el push, el post
+  sigue siendo coherente con la versión anterior (KI-10/KI-11 abiertos).
+  Tras aprobación, el auditor decide si actualizar el post o dejar
+  la versión histórica.
+
+### Verificación adversaria realizada
+
+El auditor me advirtió: "los tests deben ejercitar el CAMINO DE CONEXIÓN
+REAL, no solo la función `_resolve_and_validate_blocked` de forma
+aislada". Para verificar que mis tests lo cumplen, rompí temporalmente
+el pinning (cambié `validated_ip_capture` por `host_capture` en
+`_pinned_connect`) y ejecuté el test:
+
+```
+---TEST CON PINNING ROTO---
+E   KI-10 pinning FALLO: socket.create_connection recibió
+    ('example.com', 80), esperaba la IP validada
+assert ('example.com', 80) == ('93.184.216.34', 80)
+============================== 1 failed in 0.05s ==============================
+```
+
+El test **falla** cuando el pinning está ausente, **pasa** cuando está
+presente. Esto confirma que el test no es un assert vacío: detecta la
+ausencia real del pinning. El fetcher fue restaurado al estado
+committed tras la verificación.
+
+### Estado verificable
+
+- `pytest tests/`: **163 passed in 0.26s** (161 base + 2 nuevos de
+  KI-10/KI-11 que sustituyen a los antiguos).
+- `ruff check .`: All checks passed!
+- `python -m compileall core/ main.py`: limpio.
+- `git log --oneline | head -3`:
+  - `f57d86a feat(KI-10/11): T47 IP pinning + T48 manual redirect loop, stdlib only`
+  - `dde3348 docs+test(KI-12/13): actualizar Estado + tests citation_tracer neutralizado`
+  - `6b20c1f fix(KI-12/13): sha256 sobre cuerpo neutralizado + bypass con espacios`
+- Working tree limpio, sin push, sin repo remoto tocado.
+
+### Lo que el auditor debe verificar mañana
+
+1. `git clone` fresco y ejecución de `pytest tests/`. Esperado: 163 passed.
+2. Revisión del refactor en `core/fetcher.py`:
+   - `_pinned_connect` usa `validated_ip_capture` (no `host_capture`).
+   - HTTPS replica `wrap_socket` con `server_hostname=host_capture`.
+   - `_HttpFetcher.fetch()` loop valida IP de cada hop antes de conectar.
+3. Confirmar que los 4 tests de KI-10/KI-11 son cobertura real (no asserts vacíos):
+   - `test_fetch_pinned_ip_used_in_socket_connect`
+   - `test_fetch_dns_rebinding_two_resolutions`
+   - `test_fetch_redirect_no_connection_to_blocked_target`
+   - `test_fetch_redirect_chain_validates_each_hop`
+   - `test_fetch_redirect_limit_5`
+4. **Si todo está bien**, actualizar `sdd/KNOWN_ISSUES.md` para marcar
+   KI-10 y KI-11 como mitigados. Yo NO lo hice por respeto al flujo de
+   auditoría.
+5. **Si el push se aprueba**, ya está listo (commit limpio, working
+   tree limpio, sin spurios).
+
