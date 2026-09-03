@@ -7,7 +7,7 @@ name = "fetch-sentinel"
 version = "0.1.0"
 description = "Guardian en tiempo de fetch para agentes autonomos: defensa estructural contra inyeccion de prompts en contenido web."
 readme = "README.md"
-license = { text = "AGPL-3.0-or-later" }
+license = "AGPL-3.0-or-later"
 authors = [{ name = "Pedro Sordo Martínez", email = "amurlaniakea@gmail.com" }]
 requires-python = ">=3.10"
 keywords = ["security", "prompt-injection", "agent-security", "web-fetch", "llm"]

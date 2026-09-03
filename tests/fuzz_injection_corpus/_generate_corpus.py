@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Pedro Sordo Martínez <amurlaniakea@gmail.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Genera los 10 archivos JSON del corpus de fuzzing a partir de un spec.
 
 Se ejecuta UNA vez para crear los archivos, y los archivos resultantes
