@@ -482,3 +482,88 @@ committed tras la verificación.
 5. **Si el push se aprueba**, ya está listo (commit limpio, working
    tree limpio, sin spurios).
 
+
+---
+
+## Fase 11 — KI-14 (T51) y KI-15 (T52): cobertura de gaps en el refactor T47/T48
+
+**Fecha**: 2026-09-03 (3ª ronda de auditoría de Claude)
+
+### KI-14 — Validación de scheme en CADA salto de redirect (T51)
+
+**Bug**: `_validate_scheme()` solo se llamaba sobre la URL inicial. Un
+redirect a `gopher://public.example.com:6379/` pasaba sin queja y
+`_do_request_pinned()` lo trataba como HTTP plano, conectando
+realmente al puerto 6379 de un host público. Vector de SSRF a puerto
+arbitrario en hosts ya autorizados.
+
+**Fix** (`core/fetcher.py` línea 340): añadir
+`self._validate_scheme(new_url)` en el bucle de redirects, ANTES de
+la validación de allowlist. Si el scheme es inválido, no tiene
+sentido chequear allowlist ni DNS.
+
+**Tests añadidos** (6 nuevos en `tests/test_fetcher.py`):
+
+1. `test_fetch_redirect_to_gopher_scheme_blocked` — reproducción
+   literal del payload del auditor.
+2. `test_fetch_redirect_to_ftp_scheme_blocked` — ftp://
+3. `test_fetch_redirect_to_file_scheme_blocked` — file:///etc/passwd
+4. `test_fetch_redirect_to_javascript_scheme_blocked` — javascript:alert(1)
+5. `test_fetch_redirect_https_to_gopher_blocked` — https:// → gopher://
+6. `test_fetch_redirect_blocked_by_scheme_validates_first` — orden
+   scheme → allowlist → IP (getaddrinfo NO debe llamarse para el
+   destino bloqueado por scheme).
+
+**Verificación adversaria**: romper el check de scheme y comprobar
+que los 6 tests fallan → CONFIRMADO, 6 fallan con `pass` en lugar
+de `self._validate_scheme(new_url)`. Restaurar, vuelven a pasar.
+
+### KI-15 — Cobertura HTTPS/TLS (T52)
+
+**Bug**: la rama HTTPS de `_pinned_connect()` (ctx.wrap_socket con
+server_hostname=host) estaba completamente sin tests. Si alguien
+futuro cambiase `host_capture` por `validated_ip_capture`, la
+verificación de certificado TLS se rompería en silencio (SNI con la
+IP en vez del hostname → cert no valida hostname).
+
+**Fix**:
+- `core/fetcher.py`: mover `import ssl` a nivel de módulo (era
+  local en `_pinned_connect`; ahora testeable).
+- `tests/test_fetcher.py`: helper `patch_tls_for_https(monkeypatch)`
+  que mockea `ssl.SSLContext.wrap_socket` y captura `server_hostname`.
+
+**Tests añadidos** (4 nuevos):
+
+1. `test_fetch_https_pinned_uses_hostname_in_tls` — server_hostname
+   == "example.com" (hostname), NO la IP.
+2. `test_fetch_https_pinned_does_not_use_ip_in_tls` — variante
+   explícita: server_hostname != IP validada.
+3. `test_fetch_https_uses_default_ssl_context` — el context es
+   `ssl.SSLContext` con `verify_mode != CERT_NONE` y
+   `check_hostname == True` (defensa en profundidad: incluso si
+   SNI se rompe, la verificación sigue activa).
+4. `test_fetch_https_adversarial_server_hostname_equals_ip` —
+   test adversarial: si el código pasara la IP a wrap_socket, este
+   test fallaría con un mensaje explícito.
+
+**Verificación adversaria**: cambiar `server_hostname=host_capture`
+por `server_hostname=validated_ip_capture` → CONFIRMADO, 3 de los
+4 tests fallan (el cuarto verifica la clase del context, no
+`server_hostname` — es defensa en profundidad, ortogonal a la
+adversarial concreta).
+
+### KI-10/KI-11 — Estados actualizados
+
+- KI-10 (T47) → **mitigado en `9878e9b`**. Estado refleja realidad.
+- KI-11 (T48) → **mitigado en `9878e9b`**. Estado refleja realidad.
+- Imprecisión de doc del bucle (T53) → corregido en este commit.
+  El check `_resolve_and_validate_blocked()` en el bucle es
+  redundante con el interno de `_do_request_pinned()`; queda
+  documentado en el código.
+
+### Total
+
+- **173 tests verde** (10 nuevos: 6 T51 + 4 T52).
+- **ruff clean**.
+- **py_compile clean**.
+- 4 archivos modificados, 558 líneas añadidas, 3 eliminadas.

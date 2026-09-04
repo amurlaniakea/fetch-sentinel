@@ -668,3 +668,149 @@ Cualquier desviación requiere:
 1. Documentar el motivo en `sdd/verify_implementation.md`.
 2. Re-correr las tareas afectadas.
 3. Aprobación del auditor antes de merge.
+---
+
+## Fase 11 — Fixes post-tercera-ronda de auditoría (2026-09-03, KI-14/KI-15)
+
+Dos hallazgos del auditor externo (Claude) sobre la rama `audit/ki-10-11`
+(commits `f57d86a` + `9878e9b`). KI-10 y KI-11 confirmados cerrados por
+auditoría independiente. KI-14 y KI-15 son nuevos, ambos sin cubrir, ambos
+bloqueantes para merge a `main` / tag v0.1.0. Detalles completos en
+`sdd/KNOWN_ISSUES.md` (KI-14, KI-15).
+
+### T51 — Validación de esquema en cada salto de redirect (KI-14)
+
+**Qué**: KI-14 — `_validate_scheme()` se llama una sola vez sobre la URL
+inicial (línea 313). El bucle de redirects no vuelve a llamar a
+`_validate_scheme(new_url)`, así que un redirect a `gopher://...`,
+`ftp://...`, `file://...`, etc. pasa y `_do_request_pinned` lo trata
+como HTTP plano (porque su branch solo distingue `https` del resto).
+El fix: añadir `_validate_scheme(new_url)` en el bucle, antes de la
+validación de allowlist y de la resolución DNS.
+
+**Decisión técnica**: en el bucle, el orden correcto es:
+1. `_validate_scheme(new_url)` (rechaza scheme no soportado).
+2. Validar allowlist cross-host (`_validate_redirect`).
+3. `_resolve_and_validate_blocked(parsed_new.hostname)` (KI-7).
+4. `current_url = new_url; continue`.
+
+Este orden importa: si scheme es no soportado, no tiene sentido
+consultar allowlist ni resolver DNS — el redirect es inválido
+estructuralmente.
+
+**Tests** (`tests/test_fetcher.py`):
+- `test_fetch_redirect_to_gopher_scheme_blocked` — reproducir el
+  payload del auditor: redirect a `gopher://public.example:6379/...`
+  → `UnsupportedScheme`. Verificación adversaria: comentar la
+  llamada a `_validate_scheme` en el bucle, el test falla con
+  "el test debería haber detectado el scheme inválido".
+- `test_fetch_redirect_to_ftp_scheme_blocked` — análogo con `ftp://`.
+- `test_fetch_redirect_to_file_scheme_blocked` — análogo con
+  `file:///etc/passwd` (esquema bloqueado incluso si el host es local).
+- `test_fetch_redirect_to_javascript_scheme_blocked` — análogo.
+- `test_fetch_redirect_https_to_gopher_blocked` — scheme cambia de
+  http inicial a gopher en el redirect: `UnsupportedScheme`.
+- `test_fetch_initial_url_gopher_scheme_blocked` — la URL inicial
+  misma es `gopher://...` (este test YA existe en la sección de
+  scheme validation, lo dejo como recordatorio para no romperlo).
+
+**Done cuando**: los tests pasan + la reproducción del auditor
+(`gopher://public.example:6379/_ataque_redis`) lanza
+`UnsupportedScheme`.
+
+### T52 — Cobertura HTTPS/TLS del refactor T47 (KI-15)
+
+**Qué**: KI-15 — la rama HTTPS de `_pinned_connect` (el
+`ctx.wrap_socket(sock, server_hostname=host_capture)` que evita que
+SNI/verificación de certificado usen la IP validada en lugar del
+hostname) está completamente sin ejercitar por los tests. Todos los
+tests del refactor T47/T48 usan HTTP plano. El fix: añadir cobertura
+de la rama HTTPS, idealmente con verificación adversaria (mismo
+patrón que T47 — romper el código y ver si el test falla).
+
+**Decisión técnica**: dos rutas posibles:
+- (a) Mockear `ssl.SSLContext.wrap_socket` para verificar que
+  `server_hostname` es el hostname original. Barata, cierra justo
+  el riesgo de SNI/hostname que el auditor marcó. Riesgo: no ejercita
+  el código real de TLS, solo el contrato de la API.
+- (b) Hacer un test end-to-end contra un servidor HTTPS local real
+  (con `ssl.create_default_context()` y un cert autofirmado).
+  Ejercita TLS de verdad, pero requiere un mini-servidor HTTPS en el
+  test suite (no trivial, añade ~200 líneas a `test_fetcher.py`).
+
+**Recomendación**: opción (a) por dos razones:
+1. Cierra EXACTAMENTE el riesgo que el auditor marcó (que
+   `server_hostname` sea el hostname y no la IP). La opción (b) cierra
+   un riesgo distinto (TLS handshake real).
+2. Consistente con el patrón de mocks de T47 (FakeSocket, mocks a
+   nivel de `socket.create_connection`). El test de T47 ya demostró
+   que la suite es robusta cuando los mocks coinciden con el
+   contrato real.
+
+**Implementación opción (a)**:
+- Mockear `ssl.SSLContext.wrap_socket` para capturar el argumento
+  `server_hostname`. Verificar que es el hostname original (ej.
+  `example.com`), NO la IP (ej. `93.184.216.34`).
+- El mock debe ser por instancia (`conn._context.wrap_socket`) para
+  no interceptar el `ssl.create_default_context()` global.
+- Para HTTPS el flujo es: el fetcher hace `HTTPSConnection(host=...)`,
+  monkey-patched `connect` se llama, `socket.create_connection` se
+  mockea para devolver FakeSocket, luego `ctx.wrap_socket(sock,
+  server_hostname=host)` se llama — mock capturando `server_hostname`.
+- El test verifica:
+  1. `server_hostname == host original` (no la IP).
+  2. `server_hostname != IP validada`.
+  3. Si alguien futuro cambia `server_hostname=host_capture` por
+     `server_hostname=validated_ip_capture` o lo quita entero, el
+     test falla.
+
+**Tests** (`tests/test_fetcher.py`):
+- `test_fetch_https_pinned_uses_hostname_in_tls` — URL
+  `https://example.com/`, getaddrinfo devuelve IP pública, se
+  monkey-patchea `ssl.SSLContext.wrap_socket`, se verifica que
+  `server_hostname="example.com"`.
+- `test_fetch_https_pinned_does_not_use_ip_in_tls` — análogo
+  pero asserta explícitamente que `server_hostname != "93.184.216.34"`.
+- **Verificación adversaria (en el cuerpo del test)**: reemplazar
+  `server_hostname=host_capture` por `server_hostname=validated_ip_capture`
+  en `_pinned_connect`, ejecutar el test, debe fallar con
+  "server_hostname debería ser el hostname". Restaurar.
+- `test_fetch_https_uses_default_ssl_context` — verifica que
+  `conn._context` es `ssl.create_default_context()` (verificación
+  de que NO pasamos un contexto inseguro como `ssl._create_unverified_context`).
+
+**Done cuando**: los tests pasan + la reproducción del auditor
+(buscar `https` en `tests/test_fetcher.py`) muestra ≥1 test que
+ejercice la rama HTTPS.
+
+### T53 — Corrección del comentario sobre KI-11 en `core/fetcher.py`
+
+**Qué**: el commit `f57d86a` atribuye el cierre de KI-11 al chequeo
+`_resolve_and_validate_blocked(parsed_new.hostname)` en el bucle de
+`fetch()` (línea ~342). El auditor demostró que ese chequeo es
+redundante: la protección real vive en `_do_request_pinned` (que
+valida IP en TODA invocación, sea URL inicial o salto de redirect).
+El comportamiento ES correcto, pero el comentario confunde al lector
+sobre dónde está la defensa real. El fix: comentar el código para
+decir explícitamente que la validación del bucle es **defense in
+depth** (no la primera línea de defensa).
+
+**Cambio**: en `core/fetcher.py`, en el bucle de `fetch()`, cambiar
+el comentario que precede al `_resolve_and_validate_blocked` de
+"T48: la conexión al host nuevo NO ha ocurrido aún" a algo como
+"T48 defense-in-depth: la validación que protege de verdad está
+en `_do_request_pinned`. Esta línea es redundante (defense in
+depth) y no es estrictamente necesaria; sin ella, la conexión
+al host bloqueado seguiría sin ocurrir."
+
+**Done cuando**: el comentario del código refleja la atribución
+causal correcta, no la engañosa del commit original.
+
+---
+
+## §Cambios a este Task list
+
+Cualquier desviación requiere:
+1. Documentar el motivo en `sdd/verify_implementation.md`.
+2. Re-correr las tareas afectadas.
+3. Aprobación del auditor antes de merge.

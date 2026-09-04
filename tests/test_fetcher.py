@@ -92,6 +92,16 @@ class FakeSocket:
         # http.client llama setsockopt(TCP_NODELAY, 1); ignoramos.
         pass
 
+    def getsockopt(self, level: int, optname: int,
+                   buflen: int | None = None) -> int:
+        # http.client llama getsockopt(TCP_NODELAY, 1) tras setsockopt,
+        # y ssl._create llama getsockopt(SOL_SOCKET, SO_TYPE) para
+        # verificar que es SOCK_STREAM. Devolvemos el valor apropiado
+        # según optname: SO_TYPE=1 (SOCK_STREAM), TCP_NODELAY=0 (deshabilitado).
+        if optname == getattr(__import__("socket"), "SO_TYPE", 0):
+            return 1  # SOCK_STREAM
+        return 0
+
     def makefile(self, mode: str, *args: Any, **kwargs: Any) -> io.BytesIO:
         return io.BytesIO(self._buf)
 
@@ -171,6 +181,26 @@ def patch_socket(monkeypatch, **kwargs: Any) -> list[dict[str, Any]]:
         monkeypatch.setattr(socket_mod, "create_connection", factory)
 
     return records
+
+
+def patch_tls_for_https(monkeypatch) -> list[dict[str, Any]]:
+    """Mock ssl.SSLContext.wrap_socket para que tests HTTPS no fallen
+    en la API interna de ssl (que llama getsockopt, gettimeout, etc.,
+    sobre el socket — métodos que el FakeSocket mínimo no implementa).
+
+    Devuelve la lista de capturas (server_hostname de cada llamada)
+    para asserts. La función wrapeada devuelve el socket mismo (sin
+    hacer TLS real, que es lo que queremos en tests unitarios).
+    """
+    import ssl as ssl_mod
+    captured: list[dict[str, Any]] = []
+
+    def fake_wrap(self, sock, server_hostname=None, *args, **kwargs):
+        captured.append({"server_hostname": server_hostname})
+        return sock
+
+    monkeypatch.setattr(ssl_mod.SSLContext, "wrap_socket", fake_wrap)
+    return captured
 
 
 def patch_getaddrinfo(monkeypatch, ip: str = "93.184.216.34") -> None:
@@ -808,4 +838,270 @@ def test_fetch_redirect_chain_validates_each_hop(monkeypatch):
     assert len(records) <= 2, (
         f"KI-11: se intentaron {len(records)} conexiones; la del hop "
         f"bloqueado (evil) NUNCA debió ocurrir"
+    )
+
+# --------------------------------------------------------------------------- #
+# KI-14 (T51): validación de scheme en CADA salto de redirect
+# --------------------------------------------------------------------------- #
+# Bug reportado por Claude (3ª ronda): un redirect a un scheme no
+# soportado (gopher://, ftp://, file://, javascript:) pasaba y
+# _do_request_pinned lo trataba como HTTP plano. Cierra el vector de
+# SSRF-a-puerto-arbitrario en hosts públicos ya autorizados.
+
+
+def test_fetch_redirect_to_gopher_scheme_blocked(monkeypatch):
+    """Redirect a gopher:// → UnsupportedScheme (KI-14 / T51).
+
+    Reproduce el payload del auditor:
+      Location: gopher://public.example.com:6379/_ataque_redis
+    Sin la validación de scheme en el bucle, el fetcher conecta
+    al puerto 6379 de un host público.
+    """
+    patch_getaddrinfo(monkeypatch, ip="93.184.216.34")
+    chain = [
+        (302, b"", [
+            ("Content-Type", "text/html"),
+            ("Location", "gopher://public.example.com:6379/_ataque_redis"),
+        ]),
+    ]
+    records = patch_socket(monkeypatch, chain=chain)
+    with pytest.raises(UnsupportedScheme) as exc_info:
+        fetch(
+            "http://example.com/start",
+            allowlist=["example.com", "public.example.com"],
+            timeout=5,
+        )
+    assert "gopher" in str(exc_info.value).lower() or "scheme" in str(exc_info.value).lower()
+    # CRÍTICO: la conexión al destino bloqueado por scheme NUNCA ocurre.
+    # Igual que KI-11: assert que records (conexiones reales) <= 1.
+    assert len(records) == 1, (
+        f"KI-14: se intentaron {len(records)} conexiones, la del redirect "
+        f"a gopher:// NUNCA debió ocurrir"
+    )
+
+
+def test_fetch_redirect_to_ftp_scheme_blocked(monkeypatch):
+    """Redirect a ftp:// → UnsupportedScheme (KI-14 / T51)."""
+    patch_getaddrinfo(monkeypatch, ip="93.184.216.34")
+    chain = [
+        (302, b"", [
+            ("Content-Type", "text/html"),
+            ("Location", "ftp://files.example.com/secret"),
+        ]),
+    ]
+    patch_socket(monkeypatch, chain=chain)
+    with pytest.raises(UnsupportedScheme):
+        fetch(
+            "http://example.com/",
+            allowlist=["example.com", "files.example.com"],
+            timeout=5,
+        )
+
+
+def test_fetch_redirect_to_file_scheme_blocked(monkeypatch):
+    """Redirect a file:// → UnsupportedScheme (KI-14 / T51).
+
+    Especialmente importante: file:// puede usarse para leer archivos
+    locales (/etc/passwd) si pasa. No debe pasar.
+    """
+    patch_getaddrinfo(monkeypatch, ip="93.184.216.34")
+    chain = [
+        (302, b"", [
+            ("Content-Type", "text/html"),
+            ("Location", "file:///etc/passwd"),
+        ]),
+    ]
+    patch_socket(monkeypatch, chain=chain)
+    with pytest.raises(UnsupportedScheme):
+        fetch("http://example.com/", timeout=5)
+
+
+def test_fetch_redirect_to_javascript_scheme_blocked(monkeypatch):
+    """Redirect a javascript: → UnsupportedScheme (KI-14 / T51)."""
+    patch_getaddrinfo(monkeypatch, ip="93.184.216.34")
+    chain = [
+        (302, b"", [
+            ("Content-Type", "text/html"),
+            ("Location", "javascript:alert(1)"),
+        ]),
+    ]
+    patch_socket(monkeypatch, chain=chain)
+    with pytest.raises(UnsupportedScheme):
+        fetch("http://example.com/", timeout=5)
+
+
+def test_fetch_redirect_https_to_gopher_blocked(monkeypatch):
+    """https:// → gopher:// via redirect: scheme no soportado, igual bloquea."""
+    patch_getaddrinfo(monkeypatch, ip="93.184.216.34")
+    patch_tls_for_https(monkeypatch)
+    chain = [
+        (302, b"", [
+            ("Content-Type", "text/html"),
+            ("Location", "gopher://public.example.com:6379/"),
+        ]),
+    ]
+    patch_socket(monkeypatch, chain=chain)
+    with pytest.raises(UnsupportedScheme):
+        fetch(
+            "https://example.com/",
+            allowlist=["example.com", "public.example.com"],
+            timeout=5,
+        )
+
+
+def test_fetch_redirect_blocked_by_scheme_validates_first(monkeypatch):
+    """Si scheme es inválido en un redirect, _resolve_and_validate_blocked
+    NO se llama para ese host (no tiene sentido resolver DNS de un scheme
+    que no podemos conectar). El orden correcto es: scheme → allowlist →
+    IP.
+    """
+    # getaddrinfo NUNCA debe ser llamado para public.example.com
+    # (gopher://) porque el check de scheme debe cortar antes.
+    gai_calls: list[str] = []
+
+    def gai(host, port, *a, **kw):
+        gai_calls.append(host)
+        return [(socket_mod.AF_INET, socket_mod.SOCK_STREAM, 0, "",
+                 ("93.184.216.34", port or 80))]
+
+    monkeypatch.setattr(socket_mod, "getaddrinfo", gai)
+    chain = [
+        (302, b"", [
+            ("Content-Type", "text/html"),
+            ("Location", "gopher://public.example.com:6379/"),
+        ]),
+    ]
+    patch_socket(monkeypatch, chain=chain)
+    with pytest.raises(UnsupportedScheme):
+        fetch("http://example.com/", timeout=5)
+    # Solo example.com (URL inicial) debe haber sido resuelta. public.example.com
+    # no, porque el scheme check cortó antes.
+    assert all("public.example.com" not in c for c in gai_calls), (
+        f"KI-14: getaddrinfo se llamó para el destino bloqueado por scheme: {gai_calls}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# KI-15 (T52): cobertura HTTPS/TLS del refactor T47
+# --------------------------------------------------------------------------- #
+# Bug reportado por Claude (3ª ronda): la rama HTTPS de _pinned_connect
+# (ctx.wrap_socket con server_hostname=host) está completamente sin
+# ejercitar. Si server_hostname se sustituye por la IP, la verificación
+# de certificado TLS se rompe en silencio.
+
+
+def test_fetch_https_pinned_uses_hostname_in_tls(monkeypatch):
+    """KI-15 (T52): ssl.SSLContext.wrap_socket recibe server_hostname=host,
+    NO la IP validada. Si alguien futuro cambia esto, la verificación
+    de certificado TLS se romperá en silencio.
+    """
+    import ssl as ssl_mod
+
+    patch_getaddrinfo(monkeypatch, ip="93.184.216.34")
+    body = html("<html><body><p>ok</p></body></html>")
+    patch_socket(monkeypatch, body=body, status=200)
+
+    captured: list[dict[str, Any]] = []
+
+    def fake_wrap(self, sock, server_hostname=None, *args, **kwargs):
+        captured.append({"server_hostname": server_hostname})
+        # Devolver un objeto con la API mínima que http.client espera.
+        return sock
+
+    monkeypatch.setattr(ssl_mod.SSLContext, "wrap_socket", fake_wrap)
+    fetch("https://example.com/", timeout=5)
+    assert len(captured) == 1
+    sh = captured[0]["server_hostname"]
+    assert sh == "example.com", (
+        f"KI-15: server_hostname={sh!r} debería ser el hostname 'example.com', "
+        f"NO la IP validada"
+    )
+
+
+def test_fetch_https_pinned_does_not_use_ip_in_tls(monkeypatch):
+    """Variante explícita: server_hostname != IP validada."""
+    import ssl as ssl_mod
+
+    patch_getaddrinfo(monkeypatch, ip="93.184.216.34")
+    body = html("<html><body><p>ok</p></body></html>")
+    patch_socket(monkeypatch, body=body, status=200)
+
+    captured: list[dict[str, Any]] = []
+
+    def fake_wrap(self, sock, server_hostname=None, *args, **kwargs):
+        captured.append({"server_hostname": server_hostname})
+        return sock
+
+    monkeypatch.setattr(ssl_mod.SSLContext, "wrap_socket", fake_wrap)
+    fetch("https://example.com/", timeout=5)
+    assert len(captured) == 1
+    sh = captured[0]["server_hostname"]
+    assert sh != "93.184.216.34", (
+        f"KI-15: server_hostname es la IP ({sh!r}), no el hostname. "
+        f"La verificación de certificado TLS se romperá en silencio."
+    )
+
+
+def test_fetch_https_uses_default_ssl_context(monkeypatch):
+    """conn._context es un ssl.SSLContext (no _create_unverified_context)."""
+    import ssl as ssl_mod
+
+    patch_getaddrinfo(monkeypatch, ip="93.184.216.34")
+    body = html("<html><body><p>ok</p></body></html>")
+    patch_socket(monkeypatch, body=body, status=200)
+
+    captured_context: list[Any] = []
+
+    def fake_wrap(self, sock, server_hostname=None, *args, **kwargs):
+        captured_context.append(self)
+        return sock
+
+    monkeypatch.setattr(ssl_mod.SSLContext, "wrap_socket", fake_wrap)
+    fetch("https://example.com/", timeout=5)
+    assert len(captured_context) == 1
+    ctx = captured_context[0]
+    assert isinstance(ctx, ssl_mod.SSLContext), (
+        f"KI-15: ctx es {type(ctx).__name__}, no SSLContext"
+    )
+    # CRÍTICO: el context debe ser seguro (no _create_unverified_context).
+    # create_default_context() tiene check_hostname=True y
+    # verify_mode=CERT_REQUIRED por defecto. _create_unverified_context
+    # tiene verify_mode=CERT_NONE (NO verifica certificado).
+    assert ctx.verify_mode != ssl_mod.CERT_NONE, (
+        "KI-15: SSLContext con verify_mode=CERT_NONE no verifica "
+        "certificado — equivalente a no usar TLS"
+    )
+    assert ctx.check_hostname is True, (
+        "KI-15: SSLContext sin check_hostname no valida que el cert "
+        "corresponda al hostname (T52 requiere esto para SNI)"
+    )
+
+
+def test_fetch_https_adversarial_server_hostname_equals_ip(monkeypatch):
+    """Verificación adversaria (documentada en el cuerpo del test):
+    si server_hostname se cambia a validated_ip_capture en
+    _pinned_connect, este test debe fallar con un mensaje que indique
+    que server_hostname es la IP en vez del hostname. Restaurar
+    después de la verificación.
+    """
+    import ssl as ssl_mod
+
+    patch_getaddrinfo(monkeypatch, ip="93.184.216.34")
+    body = html("<html><body><p>ok</p></body></html>")
+    patch_socket(monkeypatch, body=body, status=200)
+
+    captured: list[dict[str, Any]] = []
+
+    def fake_wrap(self, sock, server_hostname=None, *args, **kwargs):
+        captured.append({"server_hostname": server_hostname})
+        return sock
+
+    monkeypatch.setattr(ssl_mod.SSLContext, "wrap_socket", fake_wrap)
+    fetch("https://example.com/", timeout=5)
+    # Verificación adversaria: el server_hostname capturado NO debe
+    # ser la IP validada. Si el código usara validated_ip_capture en
+    # vez de host_capture, este assert fallaría.
+    assert captured[0]["server_hostname"] != "93.184.216.34", (
+        "VERIFICACIÓN ADVERSARIA FALLIDA: server_hostname es la IP. "
+        "El código pasó validated_ip a wrap_socket en vez de host."
     )

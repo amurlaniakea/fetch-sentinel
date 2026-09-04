@@ -396,3 +396,104 @@ reproducción literal del payload (`< fetched_content>` y
 (el header externo). KI-13 cerrado.
 
 **Estado**: mitigado en `6b20c1f`.
+
+---
+
+## Actualización de estado — KI-10 y KI-11: confirmados cerrados por auditoría independiente
+
+Claude verificó T47 y T48 sobre la rama `audit/ki-10-11` (commits
+`f57d86a` + `9878e9b`) de forma independiente, repitiendo su propia
+verificación adversaria en vez de confiar en la de Hermes:
+
+- **KI-10 (pinning de IP)**: rompió `validated_ip_capture` →
+  `host_capture` en `_pinned_connect`; los tests
+  `test_fetch_pinned_ip_used_in_socket_connect` y
+  `test_fetch_dns_rebinding_two_resolutions` fallaron correctamente.
+  Restaurado, vuelven a pasar. **Confirmado cerrado.**
+- **KI-11 (redirect TOCTOU)**: comentó el chequeo
+  `_resolve_and_validate_blocked()` del bucle de `fetch()` (el que el
+  commit de Hermes presenta como el fix); el test
+  `test_fetch_redirect_no_connection_to_blocked_target` siguió
+  pasando. Causa: `_do_request_pinned()` ya valida internamente en
+  TODAS sus invocaciones, sea la URL inicial o un salto de redirect —
+  esa es la protección real, no el chequeo del bucle (que es
+  redundante, defense in depth, no dañino). **KI-11 confirmado
+  cerrado**, pero el comentario del código que atribuye el cierre al
+  chequeo del bucle debería corregirse para reflejar dónde vive la
+  protección real (ver T53 en `sdd/tasks.md`).
+
+Durante esta misma verificación, Claude encontró dos huecos nuevos,
+ninguno presente antes del refactor T47/T48 — ver KI-14 y KI-15 abajo.
+Ambos bloquean el merge de `audit/ki-10-11` a `main`.
+
+## KI-14: la validación de esquema no se aplica a los saltos de redirect
+
+**Origen**: tercera ronda de auditoría independiente de Claude, sobre la
+rama `audit/ki-10-11` (commits `f57d86a`/`9878e9b`, subproducto del
+refactor de T47/T48 — no estaba presente en versiones anteriores del
+fetcher, que tampoco lo tenían bien pero por razones distintas).
+
+**Reproducción**:
+```python
+# fetch("http://example.com/start") recibe:
+# Location: gopher://public.example:6379/_ataque_redis
+→ sin bloqueo. El fetcher conecta de verdad a (93.184.216.34, 6379)
+  y manda un GET HTTP normal, ignorando que el esquema declarado no
+  es http/https.
+```
+
+**Causa raíz**: `_HttpFetcher._validate_scheme()` se llama una sola vez,
+sobre la URL inicial, en `fetch()` línea ~313. El bucle de redirects
+nunca vuelve a llamarla para `new_url`. `_do_request_pinned()` solo
+distingue `parsed.scheme == "https"` vs. cualquier otra cosa (tratada
+como HTTP plano) — no rechaza esquemas no soportados.
+
+**Implicación**: no permite burlar `_resolve_and_validate_blocked` (las
+IPs privadas/reservadas se siguen bloqueando igual — confirmado, el
+`gopher://public.example` de la reproducción usa una IP pública a
+propósito para aislar este hallazgo del de SSRF). Pero rompe la promesa
+documentada de "esquema estricto (solo http/https)" y permite que un
+redirect dirija el fetcher a **cualquier puerto de un host público ya
+autorizado**, incluyendo puertos de servicios que no hablan HTTP (Redis,
+memcached, paneles de administración internos expuestos en puertos no
+estándar). Vector de SSRF-a-puerto-arbitrario que la Spec no contempla.
+
+**Mitigación planeada**: T51 en `sdd/tasks.md`.
+
+**Estado**: sin mitigar. Bloqueante para merge a `main` / tag v0.1.0,
+según tercera revisión de Claude del 2026-09-03.
+
+## KI-15: la ruta HTTPS/TLS del refactor T47 no tiene ningún test
+
+**Origen**: tercera ronda de auditoría independiente de Claude, sobre la
+rama `audit/ki-10-11`.
+
+**Reproducción**:
+```
+grep -n "https\|HTTPSConnection\|wrap_socket" tests/test_fetcher.py
+→ cero resultados
+```
+
+**Causa raíz**: T47 añadió `_pinned_connect` con una rama específica
+para HTTPS (`ctx.wrap_socket(sock, server_hostname=host_capture)`, para
+que SNI y la verificación de certificado usen el hostname original y no
+la IP validada — un punto que la auditoría anterior marcó
+explícitamente como "fácil de romper sutilmente"). Ningún test del
+refactor ejercita esa rama; todos los tests de T47/T48 usan HTTP plano.
+
+**Implicación**: es la pieza de mayor riesgo de seguridad de todo el
+refactor T47/T48, y la única sin ninguna red de seguridad. Si
+`server_hostname` se pierde, se pasa mal, o se sustituye por la IP en
+algún cambio futuro, el fallo podría ser silencioso (verificación de
+certificado contra el hostname equivocado, o deshabilitada de facto) en
+vez de un error ruidoso — exactamente el tipo de regresión que una
+suite de tests existe para atrapar, y que aquí no atraparía porque no
+hay ningún test en ese camino.
+
+**Mitigación planeada**: T52 en `sdd/tasks.md` — mock de
+`ssl.SSLContext.wrap_socket` para verificar que `server_hostname` es el
+hostname original, con verificación adversaria documentada (mismo
+patrón que T47).
+
+**Estado**: sin mitigar. Bloqueante para merge a `main` / tag v0.1.0,
+según tercera revisión de Claude del 2026-09-03.

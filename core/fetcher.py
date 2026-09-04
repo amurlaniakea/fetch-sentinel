@@ -332,11 +332,23 @@ class _HttpFetcher:
                     return result  # 3xx sin Location: devolvemos tal cual.
                 # Resolver URL absoluta o relativa.
                 new_url = urllib.parse.urljoin(current_url, location)
+                # KI-14 (T51): validar scheme en CADA salto de redirect.
+                # Sin esto, un redirect a gopher://, ftp://, file://, etc.
+                # pasaría y _do_request_pinned lo trataría como HTTP plano,
+                # permitiendo SSRF-a-puerto-arbitrario en hosts públicos
+                # ya autorizados (Claude, 3ª ronda de auditoría).
+                self._validate_scheme(new_url)
                 # Validar allowlist cross-host.
                 if new_url != current_url:
                     self._validate_redirect(current_url, new_url)
                 # KI-7: re-validar IP del nuevo host ANTES de conectar.
-                # (T48 — la conexión al host nuevo NO ha ocurrido aún.)
+                # NOTA (T53): la protección que cierra de verdad KI-11 vive
+                # en _do_request_pinned(), que valida la IP en TODA
+                # invocación — sea la URL inicial o un salto de redirect.
+                # Esta línea aquí es defense-in-depth: si el llamante
+                # modificase _do_request_pinned en el futuro y la
+                # validación interna fallase, esta capa del bucle
+                # seguiría protegiendo. NO es la primera línea de defensa.
                 parsed_new = urlparse(new_url)
                 if parsed_new.hostname:
                     _resolve_and_validate_blocked(parsed_new.hostname)
