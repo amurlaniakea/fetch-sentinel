@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Literal
 from xml.sax import saxutils
@@ -194,15 +195,26 @@ def _neutralize_delimiters(text: str) -> str:
     `<\t/fetched_content>`, etc. — todos los formatos que un LLM
     downstream leería como visualmente idénticos al delimitador real.
 
+    SEC-07 (variante Fullwidth): normalizar a NFKC antes del regex para
+    que `＜` (U+FF1C) y `＞` (U+FF1E) se conviertan en `<` / `>` antes de
+    matchear. Si un LLM downstream normaliza NFKC, el delimitador
+    fullwidth se interpretaría como cierre legítimo; esta capa lo cierra
+    en origen, sin depender del consumidor.
+
     Preserva el case original del token `fetched_content` para que la
     neutralización round-trippe bien si se deserializa.
     """
+    # Normalizar a NFKC PRIMERO: cubre homóglifos de corchete angular
+    # (＜ U+FF1C, ＞ U+FF1E) que algunos LLMs normalizan antes de
+    # tokenizar. Hacemos la normalización aquí, en fetch-sentinel, en
+    # vez de depender de que el consumidor la haga.
+    normalized = unicodedata.normalize("NFKC", text)
     # Tolerar whitespace opcional entre <, / y 'fetched_content'.
     # Case-insensitive en todo el match.
     return re.sub(
         r"<\s*(/?)\s*(fetched_content)\b",
         lambda m: "&lt;" + m.group(1) + m.group(2),
-        text,
+        normalized,
         flags=re.IGNORECASE,
     )
 
