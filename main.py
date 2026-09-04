@@ -14,9 +14,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import tomllib
 from collections.abc import Sequence
 from pathlib import Path
+
+import tomllib
 
 from core import citation_tracer as ct
 from core import exceptions
@@ -67,12 +68,7 @@ def _warn_unapplied_config_keys(config: dict) -> None:
     que el path no se está usando hasta que vea que el archivo se
     sigue creando en el path por defecto.
     """
-    # Claves que SÍ se aplican en _cmd_fetch (vía _apply_config_to_args).
-    applied: set[str] = {
-        # [fetch]
-        "default_timeout_seconds", "max_bytes", "allowlist",
-    }
-    # Mapeo seccion → set de claves aplicadas.
+    # Mapeo seccion → set de claves aplicadas (referencia para el loop).
     section_applied: dict[str, set[str]] = {
         "fetch": {"default_timeout_seconds", "max_bytes", "allowlist"},
     }

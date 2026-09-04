@@ -283,8 +283,9 @@ def test_warn_unapplied_config_keys_silent_when_all_applied(capsys):
 def test_apply_config_to_args_uses_config_when_cli_default():
     """SEC-05: si el usuario no pasó --timeout (valor = default 10.0),
     config.toml se aplica."""
-    from main import _apply_config_to_args
     import argparse
+
+    from main import _apply_config_to_args
     args = argparse.Namespace(
         timeout=10.0,  # default del parser
         max_bytes=5_000_000,  # default del parser
@@ -298,8 +299,9 @@ def test_apply_config_to_args_uses_config_when_cli_default():
 
 def test_apply_config_to_args_cli_overrides_config():
     """SEC-05: CLI gana sobre config.toml."""
-    from main import _apply_config_to_args
     import argparse
+
+    from main import _apply_config_to_args
     args = argparse.Namespace(
         timeout=30.0,  # usuario pasó --timeout 30
         max_bytes=5_000_000,
@@ -314,8 +316,9 @@ def test_apply_config_to_args_cli_overrides_config():
 
 def test_apply_config_to_args_uses_config_allowlist_when_cli_empty():
     """SEC-05: si CLI no pasó --allowlist y config tiene uno, se aplica."""
-    from main import _apply_config_to_args
     import argparse
+
+    from main import _apply_config_to_args
     args = argparse.Namespace(timeout=10.0, max_bytes=5_000_000, allowlist=[])
     config = {"fetch": {"allowlist": ["example.com", "github.com"]}}
     _apply_config_to_args(args, config)
@@ -325,8 +328,9 @@ def test_apply_config_to_args_uses_config_allowlist_when_cli_empty():
 def test_apply_config_to_args_warns_on_non_list_allowlist(capsys):
     """SEC-05: si config.toml tiene allowlist que no es lista, warning
     y se ignora."""
-    from main import _apply_config_to_args
     import argparse
+
+    from main import _apply_config_to_args
     args = argparse.Namespace(timeout=10.0, max_bytes=5_000_000, allowlist=[])
     config = {"fetch": {"allowlist": "esto no es una lista"}}
     _apply_config_to_args(args, config)
