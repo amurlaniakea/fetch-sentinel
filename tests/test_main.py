@@ -218,3 +218,136 @@ def test_unknown_command_returns_usage(capsys):
     with pytest.raises(SystemExit) as exc_info:
         main(["unknown"])
     assert exc_info.value.code == 2
+
+# --------------------------------------------------------------------------- #
+# SEC-05 — config.toml se lee, se aplica subordinado a CLI, se avisa
+# --------------------------------------------------------------------------- #
+
+
+def test_load_config_toml_returns_empty_if_missing(tmp_path, monkeypatch):
+    """SEC-05: si config.toml no existe, devolver dict vacío sin error."""
+    monkeypatch.chdir(tmp_path)
+    from main import _load_config_toml
+    assert _load_config_toml() == {}
+
+
+def test_load_config_toml_returns_dict_if_present(tmp_path, monkeypatch):
+    """SEC-05: si config.toml existe, devolver su contenido parseado."""
+    import tomllib as _tomllib  # noqa: F401  (smoke import, not used directly)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[fetch]\nmax_bytes = 999\n')
+    monkeypatch.chdir(tmp_path)
+    from main import _load_config_toml
+    result = _load_config_toml()
+    assert result == {"fetch": {"max_bytes": 999}}
+
+
+def test_load_config_toml_warns_on_invalid_toml(tmp_path, monkeypatch, capsys):
+    """SEC-05: TOML inválido → warning a stderr, no abortar."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('esto no es toml válido ===\n')
+    monkeypatch.chdir(tmp_path)
+    from main import _load_config_toml
+    result = _load_config_toml()
+    captured = capsys.readouterr()
+    assert result == {}
+    assert "warning" in captured.err.lower()
+    assert "toml" in captured.err.lower()
+
+
+def test_warn_unapplied_config_keys_emits_warning(capsys):
+    """SEC-05: cualquier clave no aplicable emite warning a stderr."""
+    from main import _warn_unapplied_config_keys
+    _warn_unapplied_config_keys({
+        "fetch": {"max_bytes": 1000},  # aplicable, no avisa
+        "paths": {"events_jsonl": "/otro"},  # no aplicable
+        "witness": {"key_id_prefix": "x"},  # no aplicable
+    })
+    captured = capsys.readouterr()
+    assert "[paths].events_jsonl" in captured.err
+    assert "[witness].key_id_prefix" in captured.err
+    # max_bytes NO debe aparecer porque SÍ se aplica.
+    assert "max_bytes" not in captured.err
+
+
+def test_warn_unapplied_config_keys_silent_when_all_applied(capsys):
+    """SEC-05: si todas las claves son aplicables, no spam."""
+    from main import _warn_unapplied_config_keys
+    _warn_unapplied_config_keys({
+        "fetch": {"max_bytes": 1000, "default_timeout_seconds": 5},
+    })
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_apply_config_to_args_uses_config_when_cli_default():
+    """SEC-05: si el usuario no pasó --timeout (valor = default 10.0),
+    config.toml se aplica."""
+    from main import _apply_config_to_args
+    import argparse
+    args = argparse.Namespace(
+        timeout=10.0,  # default del parser
+        max_bytes=5_000_000,  # default del parser
+        allowlist=[],
+    )
+    config = {"fetch": {"default_timeout_seconds": 42, "max_bytes": 1234}}
+    _apply_config_to_args(args, config)
+    assert args.timeout == 42
+    assert args.max_bytes == 1234
+
+
+def test_apply_config_to_args_cli_overrides_config():
+    """SEC-05: CLI gana sobre config.toml."""
+    from main import _apply_config_to_args
+    import argparse
+    args = argparse.Namespace(
+        timeout=30.0,  # usuario pasó --timeout 30
+        max_bytes=5_000_000,
+        allowlist=["google.com"],  # usuario pasó --allowlist google.com
+    )
+    config = {"fetch": {"default_timeout_seconds": 1, "max_bytes": 1234, "allowlist": ["example.com"]}}
+    _apply_config_to_args(args, config)
+    # CLI gana.
+    assert args.timeout == 30.0
+    assert args.allowlist == ["google.com"]
+
+
+def test_apply_config_to_args_uses_config_allowlist_when_cli_empty():
+    """SEC-05: si CLI no pasó --allowlist y config tiene uno, se aplica."""
+    from main import _apply_config_to_args
+    import argparse
+    args = argparse.Namespace(timeout=10.0, max_bytes=5_000_000, allowlist=[])
+    config = {"fetch": {"allowlist": ["example.com", "github.com"]}}
+    _apply_config_to_args(args, config)
+    assert args.allowlist == ["example.com", "github.com"]
+
+
+def test_apply_config_to_args_warns_on_non_list_allowlist(capsys):
+    """SEC-05: si config.toml tiene allowlist que no es lista, warning
+    y se ignora."""
+    from main import _apply_config_to_args
+    import argparse
+    args = argparse.Namespace(timeout=10.0, max_bytes=5_000_000, allowlist=[])
+    config = {"fetch": {"allowlist": "esto no es una lista"}}
+    _apply_config_to_args(args, config)
+    captured = capsys.readouterr()
+    assert "warning" in captured.err.lower()
+    assert "allowlist" in captured.err
+    # allowlist queda vacío (no se aplicó).
+    assert args.allowlist == []
+
+
+def test_main_end_to_end_uses_config_when_no_cli_flag(tmp_path, monkeypatch, capsys):
+    """SEC-05: integración completa. Sin flags CLI, config.toml aplica."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[fetch]\nallowlist = ["example.com"]\n')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.argv", ["main.py", "fetch", "http://example.com/", "--output", "json"])
+    import main as cli
+    rc = cli.main()
+    captured = capsys.readouterr()
+    # rc 0 si pasó, no 0 si falló por allowlist.
+    # Lo importante: NO debe decir "not in allowlist".
+    assert "not in allowlist" not in captured.out
+    assert "not in allowlist" not in captured.err
+    assert rc == 0
