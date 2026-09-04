@@ -341,17 +341,39 @@ def test_apply_config_to_args_warns_on_non_list_allowlist(capsys):
     assert args.allowlist == []
 
 
-def test_main_end_to_end_uses_config_when_no_cli_flag(tmp_path, monkeypatch, capsys):
-    """SEC-05: integración completa. Sin flags CLI, config.toml aplica."""
+def test_main_end_to_end_uses_config_when_no_cli_flag(tmp_path, monkeypatch, capsys, fake_witness):
+    """SEC-05: integración completa sin red.
+
+    Sin flags CLI, config.toml aplica: el allowlist de config
+    ('example.com') pasa la URL 'http://example.com/' que, de otro
+    modo, sería rechazada por fail-closed (KI-7 residual pendiente,
+    pero el comportamiento ya es coherente con esta sesión — sin
+    allowlist aplicada por config, rc sería no-cero y veríamos
+    'not in allowlist' en stderr).
+
+    NOTA: usa _patch_main_fetch para no golpear la red real.
+    Claude (auditor 3ª ronda) cazó que la versión anterior hacía
+    una llamada HTTP real, rompiendo la invariante 'no red en CI'
+    del resto de la suite. Los 9 tests SEC-05 anteriores cubren la
+    lógica sin red; este solo verifica el cableado de main().
+    """
     cfg = tmp_path / "config.toml"
     cfg.write_text('[fetch]\nallowlist = ["example.com"]\n')
     monkeypatch.chdir(tmp_path)
+    body = _html("<html><body><p>ok</p></body></html>")
+    _patch_main_fetch(monkeypatch, body=body)
     monkeypatch.setattr("sys.argv", ["main.py", "fetch", "http://example.com/", "--output", "json"])
-    import main as cli
-    rc = cli.main()
+    from main import main as cli_main
+    rc = cli_main()
     captured = capsys.readouterr()
-    # rc 0 si pasó, no 0 si falló por allowlist.
-    # Lo importante: NO debe decir "not in allowlist".
+    # rc 0 si todo OK.
+    assert rc == 0, (
+        f"main() retornó {rc}; stdout={captured.out!r}; "
+        f"stderr={captured.err!r}"
+    )
+    # El allowlist de config SÍ se aplicó (no hay rechazo de allowlist).
     assert "not in allowlist" not in captured.out
     assert "not in allowlist" not in captured.err
+    # El contenido fetched llega al LLM downstream.
+    assert "ok" in captured.out
     assert rc == 0
