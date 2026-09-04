@@ -137,15 +137,18 @@ completamente. SSRF hacia metadata de nube o red interna es exactamente
 el tipo de daño que un guardián de este tipo debería prevenir por
 defecto, no opt-in.
 
-**Mitigación planeada**: T45 en `sdd/tasks.md` — resolución de IP vía
-`socket.getaddrinfo()` + rechazo con `ipaddress.ip_address(ip).is_private
-/ .is_loopback / .is_link_local / .is_reserved`, aplicado también tras
-cada redirect. Pendiente de decisión de Pedro sobre si `allowlist=[]`
-debe seguir significando "sin restricción" (documentado) o "fallar
-cerrado sin bloqueo de rangos privados".
+**Mitigación aplicada**: T45 → `3250c4c` (parcial: `_resolve_and_validate_blocked`
+con `getaddrinfo` + `ipaddress` para rechazar rangos privados).
+Reabierto como KI-10 / KI-11 (TOCTOU + redirect) — **cerrados** en
+`f57d86a` + `9878e9b` por el refactor de pinning de IP (T47) y loop
+manual de redirects (T48). Pendiente de decisión de Pedro sobre si
+`allowlist=[]` debe seguir significando "sin restricción" (documentado)
+o "fallar cerrado sin bloqueo de rangos privados".
 
-**Estado**: sin mitigar en v0.1. Bloqueante para push a remoto según
-revisión de Claude del 2026-09-03.
+**Estado**: **parcialmente cerrado en `3250c4c`, completamente cerrado
+vía KI-10 + KI-11 mitigados en `f57d86a` / `9878e9b`** (rama
+`audit/ki-10-11`). Verificado por Claude en tercera ronda de auditoría
+(2026-09-03).
 
 ## KI-8: delimitador `<fetched_content>` no protege contra auto-cierre desde el propio cuerpo
 
@@ -175,14 +178,14 @@ contenido fetched, sin necesitar TAG block, ZWSP ni BIDI override —
 vectores que sí detecta mcp-tool-sanitizer. Este vector es ortogonal a
 KI-1 (homoglifos) y no depende de la calibración del score de sospecha.
 
-**Mitigación planeada**: T46 en `sdd/tasks.md` — dos rutas evaluadas
-(nonce de invocación en el delimitador, o neutralización de las
-secuencias literales `<fetched_content` / `</fetched_content` dentro del
-cuerpo). Decisión pendiente de Pedro porque cambia el contrato de Spec
-§3.4.
+**Mitigación aplicada**: T46 → `3250c4c` (neutralización de
+`<fetched_content` literal en el cuerpo a `&lt;fetched_content`),
+reforzada en `6b20c1f` para KI-12 (sha256 sobre cuerpo neutralizado)
+y KI-13 (bypass de espacio). Pendiente variante Unicode
+fullwidth (`＜`/`＞`) — ver triage de Gemini arriba, SEC-07.
 
-**Estado**: sin mitigar en v0.1. Bloqueante para push a remoto según
-revisión de Claude del 2026-09-03.
+**Estado**: **mitigado en `3250c4c` + `6b20c1f`** (KI-12 + KI-13).
+Variante Fullwidth (SEC-07) abierta, pendiente de decisión de Pedro.
 
 ## KI-9: `final_url` no se actualiza tras redirecciones (viola Spec §2.3)
 
@@ -275,10 +278,15 @@ privada, se rechaza — un caso mucho más simple que no ejercita la
 discrepancia entre dos resoluciones DNS distintas ni el código de
 conexión real.
 
-**Mitigación planeada**: T47 en `sdd/tasks.md`.
+**Mitigación aplicada**: T47 en `sdd/tasks.md` — refactor de
+`urllib.request.urlopen` a `http.client.HTTPConnection` con IP
+validada pasada literalmente a `socket.create_connection((ip, port))`.
 
-**Estado**: sin mitigar. Bloqueante para tag v0.1.0 / consideración de
-estable, según segunda revisión de Claude del 2026-09-03.
+**Estado**: **mitigado en `f57d86a`** (rama `audit/ki-10-11`).
+Confirmado por Claude en tercera ronda de auditoría (2026-09-03)
+con verificación adversaria: romper `validated_ip_capture` →
+`host_capture` en `_pinned_connect` hace fallar los tests de pinning
+de IP. Restaurado, vuelven a pasar.
 
 ## KI-11: redirects — la conexión al host de destino ya ocurre antes de validar su IP
 
@@ -303,12 +311,19 @@ el GET no es idempotente, fugas por timing, exposición de headers de
 respuesta del servicio interno al proceso aunque no se propaguen más
 allá).
 
-**Mitigación planeada**: T48 en `sdd/tasks.md` — deshabilitar el
-seguimiento automático de verdad y validar el `Location` antes de abrir
-cualquier conexión al destino.
+**Mitigación aplicada**: T48 en `sdd/tasks.md` — `_NoRedirectHandler`
+deja de delegar en `HTTPRedirectHandler.http_error_302`; loop manual
+en `fetch()` con validación previa al `Location` (allowlist + scheme +
+IP) y límite `max_redirects=5`. T53 corrige el comentario engañoso
+del bucle: la protección real que cierra KI-11 vive en
+`_do_request_pinned()`, que valida IP en TODA invocación.
 
-**Estado**: sin mitigar. Bloqueante para tag v0.1.0 / consideración de
-estable, según segunda revisión de Claude del 2026-09-03.
+**Estado**: **mitigado en `f57d86a` + `9878e9b`** (rama
+`audit/ki-10-11`). Confirmado por Claude en tercera ronda de
+auditoría (2026-09-03) con verificación adversaria: el chequeo del
+bucle es redundante con el interno de `_do_request_pinned`, pero la
+protección real (no abrir socket a host bloqueado por redirect) está
+verificada independientemente.
 
 ## KI-12: sha256_post_sanitize no corresponde al cuerpo real tras la neutralización de KI-8
 
@@ -458,10 +473,16 @@ autorizado**, incluyendo puertos de servicios que no hablan HTTP (Redis,
 memcached, paneles de administración internos expuestos en puertos no
 estándar). Vector de SSRF-a-puerto-arbitrario que la Spec no contempla.
 
-**Mitigación planeada**: T51 en `sdd/tasks.md`.
+**Mitigación aplicada**: T51 en `sdd/tasks.md` —
+`self._validate_scheme(new_url)` en el bucle de `fetch()` antes de
+allowlist, IP y socket. 6 tests nuevos cubren gopher://, ftp://,
+file://, javascript:, https://→gopher://, y orden scheme→allowlist→IP.
 
-**Estado**: sin mitigar. Bloqueante para merge a `main` / tag v0.1.0,
-según tercera revisión de Claude del 2026-09-03.
+**Estado**: **mitigado en `13b925e`** (rama `audit/ki-10-11`).
+Confirmado por Claude en tercera ronda de auditoría (2026-09-03)
+con verificación adversaria: reemplazar `_validate_scheme(new_url)`
+por `pass` en el bucle hace fallar 6/6 tests. Restaurado, vuelven a
+pasar.
 
 ## KI-15: la ruta HTTPS/TLS del refactor T47 no tiene ningún test
 
@@ -490,10 +511,87 @@ vez de un error ruidoso — exactamente el tipo de regresión que una
 suite de tests existe para atrapar, y que aquí no atraparía porque no
 hay ningún test en ese camino.
 
-**Mitigación planeada**: T52 en `sdd/tasks.md` — mock de
-`ssl.SSLContext.wrap_socket` para verificar que `server_hostname` es el
-hostname original, con verificación adversaria documentada (mismo
-patrón que T47).
+**Mitigación aplicada**: T52 en `sdd/tasks.md` — `import ssl`
+movido a nivel de módulo (era local en `_pinned_connect`); helper
+`patch_tls_for_https()` mockea `ssl.SSLContext.wrap_socket` y captura
+`server_hostname`. 4 tests nuevos verifican (1) `server_hostname` ==
+hostname, (2) `server_hostname` != IP, (3) `SSLContext` por defecto
+(`verify_mode != CERT_NONE`, `check_hostname == True`), (4) test
+adversarial explícito.
 
-**Estado**: sin mitigar. Bloqueante para merge a `main` / tag v0.1.0,
-según tercera revisión de Claude del 2026-09-03.
+**Estado**: **mitigado en `13b925e`** (rama `audit/ki-10-11`).
+Confirmado por Claude en tercera ronda de auditoría (2026-09-03)
+con verificación adversaria: cambiar `server_hostname=host_capture` a
+`server_hostname=validated_ip_capture` en `_pinned_connect` hace
+fallar 3/4 tests (el cuarto verifica el tipo de `SSLContext`,
+ortogonal a `server_hostname`). Restaurado, vuelven a pasar.
+
+---
+
+## Informe de Gemini (2026-09-03) — triage de hallazgos
+
+Un informe de auditoría externo (Gemini, perfil AppSec) reportó
+10 vulnerabilidades (SEC-01 a SEC-10) sobre el commit `6b20c1f` de
+`main`. Triage verificado contra el código actual (`13b925e`,
+rama `audit/ki-10-11`):
+
+- **SEC-01 / SEC-02** (TOCTOU DNS + redirect antes de validar) →
+  **KI-10 / KI-11** en este repo. **Cerrados** en `f57d86a` /
+  `9878e9b` por el refactor de pinning + loop manual de redirects
+  (T47/T48), verificado independientemente por Claude.
+- **SEC-03** ("early return en `_resolve_and_validate_blocked`
+  permite que Happy Eyeballs elija una IP no validada") → **NO
+  explotable en el código actual**. Claude ejecutó la prueba:
+  `_pinned_connect` pasa la IP literal validada a
+  `socket.create_connection((ip, port))`. No hay segunda resolución
+  DNS en el camino de conexión real, así que "Happy Eyeballs" no
+  puede preferir una IP que nunca recibió. El `return` temprano es
+  fail-closed ante cualquier ambigüedad (un solo registro bloqueado
+  rechaza toda la petición), lo cual es la postura correcta para
+  SSRF. **No se abre KI-16**; queda como observación rechazada con
+  prueba documentada arriba.
+- **SEC-04** (Capa 3 sandbox inerte) → parcialmente cierto:
+  `assert_safe_environment()` tiene `pass` literal en el loop de
+  vars prohibidas. Pero la postura de defensa (Capa 3 son
+  *convenios de proceso*, no aislamiento) está documentada en
+  `constitution.md` §3.3 y `AGENTS.md`. La purga de `os.environ`
+  que propone Gemini rompería imports legítimos. **No es
+  vulnerabilidad en el modelo de amenaza declarado**, pero es
+  mejorable en UX defensiva (warning a stderr en vez de `pass`).
+  Pendiente de decisión de Pedro.
+- **SEC-05** (`config.toml` fantasma) → cierto en el síntoma: el
+  archivo existe pero `main.py` no lo carga. La interpretación es
+  debatible: `AGENTS.md` documenta CLI como fuente de verdad, y
+  `--allowlist` en CLI manda sobre cualquier `config.toml`. El
+  riesgo real es un operador que confía en `config.toml` sin
+  saber que no se aplica. Pendiente de decisión de Pedro: (a)
+  hacer que `main.py` lo lea y emita warning si no se aplica, o
+  (b) eliminarlo del repo.
+- **SEC-06** (race condition `write_text` + `chmod`) →
+  técnicamente verdadero pero el vector requiere host multiusuario
+  o contenedor compartido, fuera del modelo de amenaza de
+  fetch-sentinel (proceso en sandbox). Hardening válido pero no
+  bloqueante.
+- **SEC-07** (bypass Fullwidth `＜`/`＞`) → **CIERTO Y ABIERTO**.
+  `_neutralize_delimiters` solo cubre `<` ASCII (U+003C). Si un
+  LLM downstream normaliza NFKC antes de tokenizar, `＜fetched_content`
+  se interpreta como cierre del delimitador. Pendiente de
+  mitigación (1 línea + 1 test) cuando Pedro lo autorice.
+- **SEC-08** (suspicion score consultivo) → decisión de diseño
+  deliberada, documentada en `constitution.md` §6.4 ("señal de
+  alerta para revisión humana, no filtro binario"). No es
+  vulnerabilidad.
+- **SEC-09** (`_KEEP_TAGS` muerto) → código muerto, limpieza
+  pendiente. No es vulnerabilidad (el comportamiento real está
+  implementado vía `_DISCARD_TAGS`).
+- **SEC-10** (shell injection en consumidor) → categoriaerror:
+  fetch-sentinel no ejecuta subprocesos. Es guía de uso indebido
+  por terceros, no vulnerabilidad del repo. Se puede publicar
+  como nota en el README si Pedro lo desea, pero no aplica fix.
+
+**Resumen del triage**: 1 hallazgo real y abierto (SEC-07), 1
+descartado con prueba (SEC-03), 4 debatibles pendientes de
+decisión de Pedro (SEC-04, SEC-05, SEC-06, SEC-09), 4 que no son
+vulnerabilidades en el modelo de amenaza declarado (SEC-08, SEC-10,
+y las 2 ya cerradas). El informe fue 70% útil, 20% debatable,
+10% marketing del tool de Gemini.
