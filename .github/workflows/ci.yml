@@ -17,8 +17,13 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # Matrix: agent-trace-witness requiere Python >=3.11 (verificado
+      # en su pyproject.toml). La intersección de las 3 deps es >=3.11.
+      # Originalmente 3.10/3.11/3.12, pero 3.10 falla con
+      # "Package 'agent-trace-witness' requires a different Python:
+      # 3.10.21 not in '>=3.11'".
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.11", "3.12"]
 
     steps:
       - name: Checkout fetch-sentinel

@@ -9,7 +9,7 @@ description = "Guardian en tiempo de fetch para agentes autonomos: defensa estru
 readme = "README.md"
 license = "AGPL-3.0-or-later"
 authors = [{ name = "Pedro Sordo Martínez", email = "amurlaniakea@gmail.com" }]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 keywords = ["security", "prompt-injection", "agent-security", "web-fetch", "llm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
