@@ -45,16 +45,22 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install fetch-sentinel (editable, with dev extras)
+      - name: Install sibling deps (editable, local clones)
+        # KI-4: las dos deps NO están en PyPI. Hay que instalarlas
+        # ANTES de `pip install -e .`, porque pyproject.toml las
+        # declara como project.dependencies y pip intentaría
+        # resolverlas en PyPI durante el install editable. Si
+        # mcp-tool-sanitizer ya está instalado editable en el
+        # mismo env, `pip install -e .` lo encuentra sin ir a PyPI.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-
-      - name: Install sibling deps (editable, local clones)
-        # KI-4: -e desde path local, NO PyPI. PyPI puede diferir del local.
-        run: |
           pip install -e .deps/mcp-tool-sanitizer
           pip install -e .deps/agent-trace-witness
+
+      - name: Install fetch-sentinel (editable, with dev extras)
+        # Las deps locales ya están instaladas, así que pip las
+        # encuentra sin ir a PyPI.
+        run: pip install -e ".[dev]"
 
       - name: Lint (ruff)
         run: python -m ruff check .
