@@ -598,3 +598,48 @@ decisión de Pedro (SEC-04, SEC-05, SEC-06, SEC-09), 4 que no son
 vulnerabilidades en el modelo de amenaza declarado (SEC-08, SEC-10,
 y las 2 ya cerradas). El informe fue 70% útil, 20% debatable,
 10% marketing del tool de Gemini.
+
+---
+
+## KI-16: discrepancia de ruff 0.16.6 con EXE001 entre mi entorno y el del auditor externo (2026-09-05)
+
+**Origen**: durante la revisión del commit `26ff7a6` (README +
+CI workflow), el auditor externo (Claude) reportó que
+`ruff check .` con `ruff==0.16.6` falla con `EXE001
+shebang-not-executable` en `main.py` (modo 100644 con shebang).
+Hermes verificó con 5 tests en 2 versiones (0.16.5 y 0.16.6) y
+NO reprodujo el error — todas las variantes pasan con exit 0.
+
+**Mediciones de Hermes (en este clon, mismo `pyproject.toml`)**:
+
+| Comando | ruff 0.16.5 | ruff 0.16.6 |
+|---|---|---|
+| `ruff check main.py` | exit 0, "All checks passed!" | exit 0, "All checks passed!" |
+| `ruff check .` | exit 0, "All checks passed!" | exit 0, "All checks passed!" |
+| `ruff check . --select EXE` | exit 0, "All checks passed!" | exit 0, "All checks passed!" |
+| `ruff check . --preview` | exit 1, 9 errores de OTRAS reglas (FURB, F), ninguno EXE | exit 0 (output vacío) |
+| `ruff check main.py --output-format=json` | (no probado) | `[]` (cero diagnósticos) |
+
+**Posibles causas de la discrepancia** (no verificadas):
+
+1. **Config local en el sandbox del auditor** (`~/.config/ruff/`,
+   `~/ruff.toml` global, o `select = ["EXE"]` en un `pyproject.toml`
+   de otro proyecto) — ruff sube por la jerarquía desde el archivo
+   y podría estar aplicando reglas que no aplica en este repo.
+2. **Medición en directorio o archivo distinto al repo real**.
+3. **Versión de ruff en otro canal** (preview, nightly) que ya
+   tiene EXE001 activado.
+
+**Decisión**: NO se aplica `chmod +x main.py` porque la premisa
+no es reproducible en este clon con la config del repo. El
+`pyproject.toml` no activa `EXE` (la regla sigue marcada como
+preview en la documentación oficial desde 0.15.22). Si en el
+futuro alguien quiere blindar esto, la fix correcta es pinear
+ruff en el workflow a una versión específica, NO añadir el bit
+ejecutable (que no resuelve el problema de raíz si la causa es
+realmente EXE en una versión futura).
+
+**Estado**: **no mitigado en este commit**, no bloqueante. Si
+el primer run del CI en GitHub Actions falla por EXE001, será
+señal de que el runner tiene una config distinta a la probada
+aquí. La fix en ese caso es pinear ruff, no chmod.
