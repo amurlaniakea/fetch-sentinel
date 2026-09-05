@@ -97,7 +97,7 @@ base64/hex, navegación interactiva, resumir contenido, indexar.
 ## Development
 
 ```bash
-.venv/bin/python -m pytest tests/                  # 138 tests
+.venv/bin/python -m pytest tests/                  # 200 tests
 .venv/bin/python -m pytest tests/fuzz_injection_corpus/   # 13 corpus tests
 .venv/bin/python -m ruff check .                   # lint
 .venv/bin/python -m py_compile core/ main.py       # syntax
@@ -132,9 +132,11 @@ fetch-sentinel/
     ├── constitution.md        # contrato no negociable
     ├── spec.md                # contratos de fetcher y structural_guard
     ├── plan.md                # orden de fases
-    ├── tasks.md               # T01-T43
+    ├── tasks.md               # T01-T53
     ├── spike_report.md        # evidencia cruda del spike de viabilidad
-    └── KNOWN_ISSUES.md        # KI-1 a KI-6
+    └── KNOWN_ISSUES.md        # KI-1 a KI-15
+                                # (KI-1..6 = limitaciones declaradas en v0.1;
+                                #  KI-7..15 = hallazgos de auditoría cerrados)
 ```
 
 ## License
