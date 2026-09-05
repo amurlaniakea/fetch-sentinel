@@ -525,14 +525,22 @@ class _HttpFetcher:
                 pass
             raise FetchError(f"network error: {e}") from e
 
-    def _validate_scheme(self, url: str) -> None:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            raise UnsupportedScheme(f"scheme {parsed.scheme!r} not supported")
+    @staticmethod
+    def _validate_scheme(url: str) -> None:
+        """Wrapper trivial sobre la función libre del módulo.
+
+        Mantenido para no romper las 2 llamadas internas
+        `self._validate_scheme(...)` en fetch() y en el bucle de
+        redirects. La lógica real vive en `validate_scheme()` de
+        módulo, accesible sin instanciar la clase.
+        """
+        validate_scheme(url)
 
     def _validate_redirect(self, from_url: str, to_url: str) -> None:
-        if self.allowlist is None:
-            return  # sin allowlist, redirects OK
+        # KI-7 residual: lista vacía o None = fail-closed (rechaza).
+        # Antes era "sin allowlist, redirects OK".
+        if not self.allowlist:
+            raise RedirectNotAllowed(from_url, to_url)
         from_host = (urlparse(from_url).hostname or "").lower()
         to_host = (urlparse(to_url).hostname or "").lower()
         if from_host == to_host:
@@ -640,10 +648,47 @@ def _resolve_and_validate_blocked(host: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def validate_scheme(url: str) -> None:
+    """Levanta UnsupportedScheme si el scheme de `url` no es http o https.
+
+    KI-7 residual (preparación): función libre de módulo, separada del
+    método `_HttpFetcher._validate_scheme` para que `fetch()` público
+    pueda llamarla sin instanciar la clase. El método de la clase
+    queda como wrapper trivial que delega aquí.
+
+    La razón histórica de no hacerlo así antes: el método usaba
+    `self` implícitamente, pero la lógica no accede a ningún estado
+    de instancia. Sacarla a función libre es refactor puro, sin
+    cambio de comportamiento.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise UnsupportedScheme(f"scheme {parsed.scheme!r} not supported")
+
+
 def _check_allowlist(url: str, allowlist: list[str] | None) -> None:
-    """Raise FetchError si URL no matchea allowlist (si allowlist is not None)."""
-    if allowlist is None:
-        return
+    """Levanta FetchError si `url` no matchea `allowlist`.
+
+    KI-7 residual (decisión de Pedro, 2026-09-04): allowlist `None` o
+    `[]` ahora se considera fail-closed (rechaza). Antes significaba
+    'sin restricción'. Cambio de comportamiento por defecto del CLI:
+    seguro por defecto. Para tests internos que necesiten el
+    comportamiento previo, pasar una lista explícita con un patrón
+    comodín — nunca se permite 'sin allowlist' de forma implícita
+    desde el CLI.
+
+    El mensaje de error apunta al CHANGELOG y a la config para que
+    el operador sepa cómo recuperarse sin tener que leer el código.
+    """
+    if allowlist is None or len(allowlist) == 0:
+        raise FetchError(
+            f"url {url!r} rejected: allowlist is empty. "
+            f"Pass --allowlist <pattern> (repeatable) or set "
+            f"[fetch].allowlist in config.toml. "
+            f"fetch-sentinel v0.2+ defaults to fail-closed: "
+            f"empty allowlist means 'no host is allowed', NOT "
+            f"'all hosts are allowed'."
+        )
     host = (urlparse(url).hostname or "").lower()
     for pattern in allowlist:
         if _match_host(host, pattern):
@@ -670,8 +715,10 @@ def fetch(
         url: Solo http:// o https://.
         timeout: Segundos. Aplica a connect + read.
         max_bytes: Tope duro del cuerpo.
-        allowlist: Si se da, la URL Y cualquier redirect cross-origin
-            deben matchear al menos un patrón (sufijo DNS).
+        allowlist: Lista de patrones DNS (sufijo) permitidos. Si se da,
+            la URL Y cualquier redirect cross-origin deben matchear al
+            menos un patrón. None y [] se consideran fail-closed
+            (rechaza) — KI-7 residual, decisión de Pedro 2026-09-04.
         _opener: Param de inyección para tests. No usar en producción.
 
     Returns:
@@ -682,6 +729,12 @@ def fetch(
         UnsupportedScheme, UnsupportedContentType, HTTPError,
         SizeExceeded, Timeout, RedirectNotAllowed, EmptyBody.
     """
+    # Orden de validación: scheme → allowlist → IP. Scheme primero
+    # porque una URL con scheme no soportado (file://, javascript:)
+    # no puede tener host parseable, así que el check de allowlist
+    # no podría ejecutarse significativamente. Consistente con el
+    # orden aplicado en redirects (T51).
+    validate_scheme(url)
     _check_allowlist(url, allowlist)
 
     http = _HttpFetcher(

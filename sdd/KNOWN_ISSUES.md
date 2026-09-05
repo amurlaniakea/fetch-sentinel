@@ -141,14 +141,17 @@ defecto, no opt-in.
 con `getaddrinfo` + `ipaddress` para rechazar rangos privados).
 Reabierto como KI-10 / KI-11 (TOCTOU + redirect) — **cerrados** en
 `f57d86a` + `9878e9b` por el refactor de pinning de IP (T47) y loop
-manual de redirects (T48). Pendiente de decisión de Pedro sobre si
-`allowlist=[]` debe seguir significando "sin restricción" (documentado)
-o "fallar cerrado sin bloqueo de rangos privados".
+manual de redirects (T48). El KI-7 residual (decisión de Pedro
+2026-09-04: `allowlist=[]` debe significar "fail-closed" en vez de
+"sin restricción") se implementa en este commit.
 
-**Estado**: **parcialmente cerrado en `3250c4c`, completamente cerrado
-vía KI-10 + KI-11 mitigados en `f57d86a` / `9878e9b`** (rama
-`audit/ki-10-11`). Verificado por Claude en tercera ronda de auditoría
-(2026-09-03).
+**Estado**: **completamente cerrado en `<este-commit>`** (rama
+`audit/ki-10-11`). KI-10/11/12/13/14/15 + KI-7 residual cerrados.
+Verificado por Claude en tercera ronda de auditoría (2026-09-03)
+para KI-10/11/14/15; KI-7 residual pendiente de auditoría externa
+(la verificación adversaria en este commit rompió `_check_allowlist`
+y `_validate_redirect` y confirmó que los tests del fail-closed
+fallan correctamente).
 
 ## KI-8: delimitador `<fetched_content>` no protege contra auto-cierre desde el propio cuerpo
 

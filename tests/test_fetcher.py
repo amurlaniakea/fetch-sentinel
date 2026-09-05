@@ -39,11 +39,13 @@ from core.fetcher import (
     HTTPError,
     ReadabilityExtractor,
     RedirectLimitExceeded,
+    RedirectNotAllowed,
     SizeExceeded,
     Timeout,
     UnsupportedContentType,
     UnsupportedScheme,
     _check_allowlist,
+    _HttpFetcher,
     _match_host,
     fetch,
 )
@@ -348,8 +350,33 @@ def test_extractor_nested_script_inside_div():
 # --------------------------------------------------------------------------- #
 
 
-def test_check_allowlist_none_allows_all():
-    _check_allowlist("http://anything.com/page", None)
+def test_check_allowlist_none_rejects():
+    """KI-7 residual: allowlist None ahora se considera fail-closed
+    (rechaza). Antes significaba 'sin restricción'. Cambio de default
+    del CLI documentado en CHANGELOG.
+
+    El mensaje de error apunta a --allowlist y a [fetch].allowlist en
+    config.toml para que el operador sepa cómo recuperarse.
+    """
+    with pytest.raises(fetcher.FetchError) as exc_info:
+        _check_allowlist("http://anything.com/page", None)
+    assert "allowlist is empty" in str(exc_info.value)
+    assert "fail-closed" in str(exc_info.value)
+
+
+def test_check_allowlist_empty_list_rejects():
+    """KI-7 residual: lista vacía [] también es fail-closed (rechaza)."""
+    with pytest.raises(fetcher.FetchError) as exc_info:
+        _check_allowlist("http://anything.com/page", [])
+    assert "allowlist is empty" in str(exc_info.value)
+
+
+def test_check_allowlist_none_and_empty_same_behavior():
+    """KI-7 residual: None y [] se tratan igual (fail-closed)."""
+    with pytest.raises(fetcher.FetchError):
+        _check_allowlist("http://x/", None)
+    with pytest.raises(fetcher.FetchError):
+        _check_allowlist("http://x/", [])
 
 
 def test_check_allowlist_match_exact():
@@ -373,6 +400,58 @@ def test_match_host():
 
 
 # --------------------------------------------------------------------------- #
+# _validate_redirect — fail-closed (defensa en profundidad)
+# --------------------------------------------------------------------------- #
+# KI-7 residual: _validate_redirect rechaza si allowlist está vacío
+# (None o []). En la práctica, fetch() público nunca llega a este
+# método con allowlist vacío porque _check_allowlist corta antes,
+# pero el método debe seguir siendo seguro si se llama directamente
+# (mismo patrón que el chequeo del bucle de redirects en KI-11/T53,
+# documentado como defensa en profundidad).
+
+
+def test_validate_redirect_empty_allowlist_rejects():
+    """KI-7 residual: allowlist vacío en _validate_redirect = fail-closed."""
+    http = _HttpFetcher(
+        timeout=5, max_bytes=1000, allowlist=None, _opener=None
+    )
+    with pytest.raises(RedirectNotAllowed):
+        http._validate_redirect("http://a.example/", "http://b.example/")
+
+
+def test_validate_redirect_empty_list_allowlist_rejects():
+    """KI-7 residual: lista vacía en _validate_redirect = fail-closed."""
+    http = _HttpFetcher(
+        timeout=5, max_bytes=1000, allowlist=[], _opener=None
+    )
+    with pytest.raises(RedirectNotAllowed):
+        http._validate_redirect("http://a.example/", "http://b.example/")
+
+
+def test_validate_redirect_populated_allowlist_match():
+    """Con allowlist poblado y match, no raise."""
+    http = _HttpFetcher(
+        timeout=5, max_bytes=1000,
+        allowlist=["example.com", "other.com"], _opener=None
+    )
+    http._validate_redirect(
+        "http://example.com/a", "http://other.com/b"
+    )
+
+
+def test_validate_redirect_populated_allowlist_no_match():
+    """Con allowlist poblado y sin match, raise."""
+    http = _HttpFetcher(
+        timeout=5, max_bytes=1000,
+        allowlist=["example.com"], _opener=None
+    )
+    with pytest.raises(RedirectNotAllowed):
+        http._validate_redirect(
+            "http://example.com/a", "http://attacker.com/b"
+        )
+
+
+# --------------------------------------------------------------------------- #
 # fetch() orquestador — happy path + errores
 # --------------------------------------------------------------------------- #
 
@@ -382,7 +461,7 @@ def test_fetch_happy_path(monkeypatch):
     patch_getaddrinfo(monkeypatch, ip="93.184.216.34")
     body = html("<html><body><h1>Title</h1><p>Hello world.</p></body></html>")
     records = patch_socket(monkeypatch, body=body, status=200)
-    result = fetch("http://example.com/", timeout=5)
+    result = fetch("http://example.com/", timeout=5, allowlist=['example.com'])
     assert isinstance(result, FetchResult)
     assert "Title" in result.text
     assert "Hello world." in result.text
@@ -401,7 +480,7 @@ def test_fetch_sha256_html_and_text_differ(monkeypatch):
     patch_getaddrinfo(monkeypatch)
     body = html("<html><body><h1>Hi</h1></body></html>")
     patch_socket(monkeypatch, body=body, status=200)
-    result = fetch("http://example.com/", timeout=5)
+    result = fetch("http://example.com/", timeout=5, allowlist=['example.com'])
     assert result.sha256_html != result.sha256_text
 
 
@@ -427,7 +506,7 @@ def test_fetch_http_error_404(monkeypatch):
     body = b""
     patch_socket(monkeypatch, body=body, status=404, headers=[])
     with pytest.raises(HTTPError) as exc_info:
-        fetch("http://example.com/missing", timeout=5)
+        fetch("http://example.com/missing", timeout=5, allowlist=['example.com'])
     assert exc_info.value.status_code == 404
 
 
@@ -437,7 +516,7 @@ def test_fetch_http_error_500(monkeypatch):
     body = b""
     patch_socket(monkeypatch, body=body, status=500, headers=[])
     with pytest.raises(HTTPError) as exc_info:
-        fetch("http://example.com/error", timeout=5)
+        fetch("http://example.com/error", timeout=5, allowlist=['example.com'])
     assert exc_info.value.status_code == 500
 
 
@@ -452,7 +531,7 @@ def test_fetch_unsupported_content_type_json(monkeypatch):
         headers=[("Content-Type", "application/json")],
     )
     with pytest.raises(UnsupportedContentType):
-        fetch("http://example.com/api", timeout=5)
+        fetch("http://example.com/api", timeout=5, allowlist=['example.com'])
 
 
 def test_fetch_size_exceeded(monkeypatch):
@@ -461,7 +540,7 @@ def test_fetch_size_exceeded(monkeypatch):
     body = b"x" * 200
     patch_socket(monkeypatch, body=body, status=200)
     with pytest.raises(SizeExceeded) as exc_info:
-        fetch("http://example.com/", max_bytes=100, timeout=5)
+        fetch("http://example.com/", max_bytes=100, timeout=5, allowlist=['example.com'])
     assert exc_info.value.limit == 100
 
 
@@ -500,7 +579,7 @@ def test_fetch_timeout_raises(monkeypatch):
     )
 
     with pytest.raises(Timeout):
-        fetch("http://example.com/", timeout=0.5)
+        fetch("http://example.com/", timeout=0.5, allowlist=['example.com'])
 
 
 def test_fetch_empty_body_raises(monkeypatch):
@@ -509,7 +588,7 @@ def test_fetch_empty_body_raises(monkeypatch):
     body = html("<html><head></head><body></body></html>")
     patch_socket(monkeypatch, body=body, status=200)
     with pytest.raises(EmptyBody):
-        fetch("http://example.com/", timeout=5)
+        fetch("http://example.com/", timeout=5, allowlist=['example.com'])
 
 
 def test_fetch_url_in_result(monkeypatch):
@@ -517,7 +596,7 @@ def test_fetch_url_in_result(monkeypatch):
     patch_getaddrinfo(monkeypatch)
     body = html("<html><body><p>ok</p></body></html>")
     patch_socket(monkeypatch, body=body, status=200)
-    result = fetch("http://example.com/page", timeout=5)
+    result = fetch("http://example.com/page", timeout=5, allowlist=['example.com'])
     assert result.url == "http://example.com/page"
 
 
@@ -526,7 +605,7 @@ def test_fetch_bytes_read_matches_body(monkeypatch):
     patch_getaddrinfo(monkeypatch)
     body = html("<html><body><p>some content here that is long enough</p></body></html>")
     patch_socket(monkeypatch, body=body, status=200)
-    result = fetch("http://example.com/", timeout=5)
+    result = fetch("http://example.com/", timeout=5, allowlist=['example.com'])
     # bytes_read es el tamaño de los bytes HTTP completos (headers + body).
     # En HTTP/1.1, headers + CRLFCRLF + body. Aquí validamos que coincide
     # con la longitud del body que mockeamos (la longitud total HTTP
@@ -544,7 +623,7 @@ def test_fetch_final_url_unchanged_when_no_redirect(monkeypatch):
     patch_getaddrinfo(monkeypatch)
     body = html("<html><body><p>hi</p></body></html>")
     patch_socket(monkeypatch, body=body, status=200)
-    result = fetch("http://example.com/", timeout=5)
+    result = fetch("http://example.com/", timeout=5, allowlist=['example.com'])
     assert result.final_url == "http://example.com/"
     assert result.final_url == result.url
 
@@ -601,7 +680,7 @@ def test_fetch_blocked_loopback_127(monkeypatch):
     monkeypatch.setattr(socket_mod, "getaddrinfo", gai)
     # No patcheamos socket.create_connection: si se llama, el test falla.
     with pytest.raises(BlockedAddress) as exc_info:
-        fetch("http://127.0.0.1/", timeout=1)
+        fetch("http://127.0.0.1/", timeout=1, allowlist=['127.0.0.1'])
     assert exc_info.value.host == "127.0.0.1"
     assert exc_info.value.reason == "loopback"
 
@@ -613,7 +692,7 @@ def test_fetch_blocked_private_10(monkeypatch):
                  ("10.0.0.1", port or 80))]
     monkeypatch.setattr(socket_mod, "getaddrinfo", gai)
     with pytest.raises(BlockedAddress) as exc_info:
-        fetch("http://10.0.0.1/", timeout=1)
+        fetch("http://10.0.0.1/", timeout=1, allowlist=['10.0.0.1'])
     assert exc_info.value.reason == "private"
 
 
@@ -626,7 +705,7 @@ def test_fetch_blocked_link_local_169_254(monkeypatch):
                  ("169.254.169.254", port or 80))]
     monkeypatch.setattr(socket_mod, "getaddrinfo", gai)
     with pytest.raises(BlockedAddress) as exc_info:
-        fetch("http://169.254.169.254/latest/meta-data/", timeout=1)
+        fetch("http://169.254.169.254/latest/meta-data/", timeout=1, allowlist=['169.254.169.254'])
     assert exc_info.value.reason == "link_local"
 
 
@@ -637,7 +716,7 @@ def test_fetch_blocked_unspecified_0_0_0_0(monkeypatch):
                  ("0.0.0.0", port or 80))]
     monkeypatch.setattr(socket_mod, "getaddrinfo", gai)
     with pytest.raises(BlockedAddress) as exc_info:
-        fetch("http://0.0.0.0/", timeout=1)
+        fetch("http://0.0.0.0/", timeout=1, allowlist=['0.0.0.0'])
     assert exc_info.value.reason == "unspecified"
 
 
@@ -656,7 +735,7 @@ def test_fetch_pinned_ip_used_in_socket_connect(monkeypatch):
     patch_getaddrinfo(monkeypatch, ip="93.184.216.34")
     body = html("<html><body><p>ok</p></body></html>")
     records = patch_socket(monkeypatch, body=body, status=200)
-    fetch("http://example.com/", timeout=5)
+    fetch("http://example.com/", timeout=5, allowlist=['example.com'])
     # CRÍTICO: la address es (93.184.216.34, 80), NO ('example.com', 80).
     assert records[0]["address"] == ("93.184.216.34", 80), (
         f"KI-10 pinning FALLO: socket.create_connection recibió "
@@ -692,7 +771,7 @@ def test_fetch_dns_rebinding_two_resolutions(monkeypatch):
     monkeypatch.setattr(socket_mod, "getaddrinfo", gai)
     body = html("<html><body><p>ok</p></body></html>")
     records = patch_socket(monkeypatch, body=body, status=200)
-    fetch("http://example.com/", timeout=5)
+    fetch("http://example.com/", timeout=5, allowlist=['example.com'])
     # SOLO se registra UNA llamada a create_connection (la del fetcher
     # con IP validada). http.client NO hace una segunda porque el
     # pinning sobrescribe connect() para usar la IP validada.
@@ -770,7 +849,7 @@ def test_fetch_redirect_limit_5(monkeypatch):
     ]
     patch_socket(monkeypatch, chain=chain)
     with pytest.raises(RedirectLimitExceeded) as exc_info:
-        fetch("http://example.com/hop0", timeout=5)
+        fetch("http://example.com/hop0", timeout=5, allowlist=['example.com'])
     assert exc_info.value.max_redirects == 5  # DEFAULT_MAX_REDIRECTS
 
 
@@ -913,7 +992,7 @@ def test_fetch_redirect_to_file_scheme_blocked(monkeypatch):
     ]
     patch_socket(monkeypatch, chain=chain)
     with pytest.raises(UnsupportedScheme):
-        fetch("http://example.com/", timeout=5)
+        fetch("http://example.com/", timeout=5, allowlist=['example.com'])
 
 
 def test_fetch_redirect_to_javascript_scheme_blocked(monkeypatch):
@@ -927,7 +1006,7 @@ def test_fetch_redirect_to_javascript_scheme_blocked(monkeypatch):
     ]
     patch_socket(monkeypatch, chain=chain)
     with pytest.raises(UnsupportedScheme):
-        fetch("http://example.com/", timeout=5)
+        fetch("http://example.com/", timeout=5, allowlist=['example.com'])
 
 
 def test_fetch_redirect_https_to_gopher_blocked(monkeypatch):
@@ -973,7 +1052,7 @@ def test_fetch_redirect_blocked_by_scheme_validates_first(monkeypatch):
     ]
     patch_socket(monkeypatch, chain=chain)
     with pytest.raises(UnsupportedScheme):
-        fetch("http://example.com/", timeout=5)
+        fetch("http://example.com/", timeout=5, allowlist=['example.com'])
     # Solo example.com (URL inicial) debe haber sido resuelta. public.example.com
     # no, porque el scheme check cortó antes.
     assert all("public.example.com" not in c for c in gai_calls), (
@@ -1009,7 +1088,7 @@ def test_fetch_https_pinned_uses_hostname_in_tls(monkeypatch):
         return sock
 
     monkeypatch.setattr(ssl_mod.SSLContext, "wrap_socket", fake_wrap)
-    fetch("https://example.com/", timeout=5)
+    fetch("https://example.com/", timeout=5, allowlist=['example.com'])
     assert len(captured) == 1
     sh = captured[0]["server_hostname"]
     assert sh == "example.com", (
@@ -1033,7 +1112,7 @@ def test_fetch_https_pinned_does_not_use_ip_in_tls(monkeypatch):
         return sock
 
     monkeypatch.setattr(ssl_mod.SSLContext, "wrap_socket", fake_wrap)
-    fetch("https://example.com/", timeout=5)
+    fetch("https://example.com/", timeout=5, allowlist=['example.com'])
     assert len(captured) == 1
     sh = captured[0]["server_hostname"]
     assert sh != "93.184.216.34", (
@@ -1057,7 +1136,7 @@ def test_fetch_https_uses_default_ssl_context(monkeypatch):
         return sock
 
     monkeypatch.setattr(ssl_mod.SSLContext, "wrap_socket", fake_wrap)
-    fetch("https://example.com/", timeout=5)
+    fetch("https://example.com/", timeout=5, allowlist=['example.com'])
     assert len(captured_context) == 1
     ctx = captured_context[0]
     assert isinstance(ctx, ssl_mod.SSLContext), (
@@ -1097,7 +1176,7 @@ def test_fetch_https_adversarial_server_hostname_equals_ip(monkeypatch):
         return sock
 
     monkeypatch.setattr(ssl_mod.SSLContext, "wrap_socket", fake_wrap)
-    fetch("https://example.com/", timeout=5)
+    fetch("https://example.com/", timeout=5, allowlist=['example.com'])
     # Verificación adversaria: el server_hostname capturado NO debe
     # ser la IP validada. Si el código usara validated_ip_capture en
     # vez de host_capture, este assert fallaría.

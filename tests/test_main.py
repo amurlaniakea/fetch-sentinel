@@ -79,7 +79,7 @@ def test_puerta_mode_default_emits_delimited_text(fake_witness, monkeypatch, cap
     from main import main
     body = _html("<html><body><h1>Title</h1><p>Hello world.</p></body></html>")
     _patch_main_fetch(monkeypatch, body=body)
-    rc = main(["fetch", "http://example.com/"])
+    rc = main(["fetch", "http://example.com/", "--allowlist", "example.com"])
     assert rc == 0
     captured = capsys.readouterr()
     assert "<fetched_content" in captured.out
@@ -91,7 +91,7 @@ def test_puerta_mode_no_citations_in_output(fake_witness, monkeypatch, capsys):
     from main import main
     body = _html("<html><body><p>Some text.</p></body></html>")
     _patch_main_fetch(monkeypatch, body=body)
-    rc = main(["fetch", "http://example.com/"])
+    rc = main(["fetch", "http://example.com/", "--allowlist", "example.com"])
     assert rc == 0
     captured = capsys.readouterr()
     assert "citations" not in captured.out
@@ -106,7 +106,7 @@ def test_trazado_mode_with_trace_emits_citations(fake_witness, monkeypatch, caps
     from main import main
     body = _html("<html><body><p>Hello world.</p></body></html>")
     _patch_main_fetch(monkeypatch, body=body)
-    rc = main(["fetch", "http://example.com/", "--trace", "Hello world."])
+    rc = main(["fetch", "http://example.com/", "--trace", "Hello world.", "--allowlist", "example.com"])
     assert rc == 0
     captured = capsys.readouterr()
     assert "citations" in captured.out
@@ -119,7 +119,7 @@ def test_trazado_mode_claim_not_found_returns_usage_exit(
     from main import main
     body = _html("<html><body><p>Hello world.</p></body></html>")
     _patch_main_fetch(monkeypatch, body=body)
-    rc = main(["fetch", "http://example.com/", "--trace", "nonexistent phrase"])
+    rc = main(["fetch", "http://example.com/", "--trace", "nonexistent phrase", "--allowlist", "example.com"])
     assert rc == 1  # EXIT_USAGE para CitationError
     captured = capsys.readouterr()
     assert "citation error" in captured.err
@@ -134,7 +134,7 @@ def test_exit_code_2_on_fetch_error(fake_witness, monkeypatch, capsys):
     """404 → HTTPError → exit code 2 (EXIT_FETCH)."""
     from main import main
     _patch_main_fetch(monkeypatch, body=b"", status=404)
-    rc = main(["fetch", "http://example.com/"])
+    rc = main(["fetch", "http://example.com/", "--allowlist", "example.com"])
     assert rc == 2
     captured = capsys.readouterr()
     assert "fetch error" in captured.err
@@ -156,7 +156,7 @@ def test_exit_code_3_on_guard_error(fake_witness, monkeypatch, capsys):
     # normal para que fetch() no falle antes de sanitize.
     body = _html("<html><body><p>ok</p></body></html>")
     _patch_main_fetch(monkeypatch, body=body)
-    rc = main(["fetch", "http://example.com/"])
+    rc = main(["fetch", "http://example.com/", "--allowlist", "example.com"])
     assert rc == 3  # EXIT_GUARD para GuardError
     captured = capsys.readouterr()
     assert "guard error" in captured.err
@@ -171,7 +171,7 @@ def test_output_json_is_canonical(fake_witness, monkeypatch, capsys):
     from main import main
     body = _html("<html><body><p>JSON test.</p></body></html>")
     _patch_main_fetch(monkeypatch, body=body)
-    rc = main(["fetch", "http://example.com/", "--output", "json"])
+    rc = main(["fetch", "http://example.com/", "--output", "json", "--allowlist", "example.com"])
     assert rc == 0
     captured = capsys.readouterr()
     data = json.loads(captured.out)
@@ -192,6 +192,7 @@ def test_no_suspicion_score_emits_zero(fake_witness, monkeypatch, capsys):
     _patch_main_fetch(monkeypatch, body=body)
     rc = main([
         "fetch", "http://example.com/",
+        "--allowlist", "example.com",
         "--no-suspicion-score",
         "--output", "json",
     ])

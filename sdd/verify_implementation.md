@@ -567,3 +567,108 @@ adversarial concreta).
 - **ruff clean**.
 - **py_compile clean**.
 - 4 archivos modificados, 558 líneas añadidas, 3 eliminadas.
+
+---
+
+## Fase 12 — KI-7 residual: allowlist vacío = fail-closed (2026-09-04)
+
+**Decisión**: cambio de default del CLI, no fix de bug. Antes
+`--allowlist` ausente o `[]` significaba "sin restricción" (el fetcher
+aceptaba CUALQUIER URL). Ahora significa "fail-closed" (rechaza con
+`FetchError("allowlist is empty")` y `rc=2`). Coherente con la
+postura "seguro por defecto" del resto del proyecto (SSRF block,
+structural guard, witness client).
+
+### Cambios aplicados
+
+**`core/fetcher.py`**:
+
+1. `_validate_scheme` se refactoriza como **función libre de módulo**
+   `validate_scheme(url)` (decisión clave que arregló el intento
+   fallido anterior). El método `_HttpFetcher._validate_scheme`
+   queda como `@staticmethod` que delega a la función libre,
+   manteniendo las 2 llamadas internas (`self._validate_scheme(url)`
+   en `fetch()` y en el bucle de redirects) sin cambios.
+
+2. `_check_allowlist`: `None` o `[]` ahora raise `FetchError` con
+   mensaje que apunta a `--allowlist`, `config.toml`, y al CHANGELOG.
+   Cambio de comportamiento documentado en el docstring.
+
+3. `_validate_redirect`: mismo fail-closed (`if not self.allowlist:
+   raise RedirectNotAllowed`). Documentado como defensa en
+   profundidad — inalcanzable vía `fetch()` público porque
+   `_check_allowlist` corta antes, pero el método debe seguir
+   siendo seguro si se llama directamente (mismo patrón que T53
+   para KI-11).
+
+4. `fetch()` público: reordenado a **scheme → allowlist → IP**
+   (antes era allowlist → scheme). El check de scheme primero
+   permite que URLs con scheme no soportado (`file://`,
+   `javascript:`) se rechacen limpiamente sin tener que evaluar
+   una allowlist sin host parseable.
+
+**`main.py`**:
+
+5. `allowlist=args.allowlist` (antes `or None` que convertía lista
+   vacía en `None` = "sin restricción"). Ahora vacío se mantiene
+   vacío y se delega la decisión a `_check_allowlist`.
+
+**`config.toml`** (en el repo):
+
+6. `allowlist = []` reemplazado por `allowlist = ["example.com"]`
+   (un ejemplo razonable) con un comentario prominente en la
+   cabecera del archivo explicando KI-7 residual y apuntando al
+   CHANGELOG. Sin esto, el `config.toml` por defecto del repo
+   rechazaba TODO con la nueva semántica fail-closed.
+
+### Tests añadidos / actualizados
+
+- 25 llamadas `fetch(...)` en `test_fetcher.py` actualizadas con
+  `allowlist=[<host>]` extraído de la URL (script con
+  bracket-matching que soporta multilínea).
+- 8 llamadas `main([...])` en `test_main.py` actualizadas con
+  `--allowlist example.com`.
+- 1 test eliminado: `test_check_allowlist_none_allows_all`
+  (probaba el comportamiento viejo).
+- 3 tests nuevos del fail-closed:
+  - `test_check_allowlist_none_rejects`
+  - `test_check_allowlist_empty_list_rejects`
+  - `test_check_allowlist_none_and_empty_same_behavior`
+- 4 tests nuevos de `_validate_redirect` directo (defensa en
+  profundidad, inalcanzable vía `fetch()` público).
+
+**Total: 200 tests verde** (de 194 antes de este commit).
+
+### Verificación adversaria
+
+Dos scripts ad-hoc:
+
+1. **Romper `_check_allowlist`** (reemplazar el bloque fail-closed
+   por `pass`): los 3 tests del fail-closed fallan. Restaurado,
+   vuelven a pasar.
+2. **Romper `_validate_redirect`** (reemplazar el bloque fail-closed
+   por `pass`): `test_validate_redirect_empty_allowlist_rejects`
+   falla con `TypeError: 'NoneType' object is not iterable` (en el
+   `for pattern in self.allowlist` posterior). El test detecta la
+   ausencia del check, no es assert vacío.
+
+### Smoke test del CLI (rc verificado)
+
+- **Sin config.toml, sin --allowlist**: `rc=2`, mensaje "allowlist
+  is empty", fail-closed funcional.
+- **Con config.toml poblado (`allowlist = ["example.com"]`)**:
+  `rc=0`, fetch exitoso.
+- **Con `--allowlist example.com` en CLI (sin config.toml)**:
+  `rc=0`, fetch exitoso.
+
+### Documentación actualizada
+
+- **`CHANGELOG.md`** (nuevo archivo en el repo): sección
+  `[Unreleased]` con `⚠️ BREAKING CHANGES` describiendo KI-7
+  residual, SEC-07, SEC-04, SEC-05. Cada cambio tiene "Por qué",
+  "Cómo adaptarse" (donde aplica), y referencia a la spec.
+- **`sdd/spec.md §2.2`**: fila de `allowlist` actualizada para
+  reflejar el nuevo default fail-closed.
+- **`sdd/KNOWN_ISSUES.md`**: KI-7 marcado como completamente
+  cerrado en este commit, con resumen de los KI relacionados
+  (10/11/12/13/14/15 también cerrados).

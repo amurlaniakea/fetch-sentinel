@@ -153,11 +153,16 @@ def _cmd_fetch(args: argparse.Namespace) -> int:
     sb.assert_safe_environment()
 
     # Capa 1 — fetch.
+    # KI-7 residual: pasar args.allowlist directamente (lista vacía si
+    # el usuario no pasó --allowlist). Antes era 'or None' que convertía
+    # la lista vacía en None = "sin restricción". Ahora vacío = fail-closed
+    # (rechaza, "ningún host permitido"). Cambio de comportamiento del
+    # default del CLI documentado en CHANGELOG.
     fetch_result = ft.fetch(
         args.url,
         timeout=args.timeout,
         max_bytes=args.max_bytes,
-        allowlist=args.allowlist or None,
+        allowlist=args.allowlist,
     )
 
     # Capa 4.1 — witness: registrar tool_call.
