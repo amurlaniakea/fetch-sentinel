@@ -1,7 +1,14 @@
+# KI-7 residual (v0.2+, 2026-09-04): `allowlist = []` se considera
+# fail-closed. El default de abajo es un EJEMPLO; reemplázalo por la
+# lista de hosts que tu agente necesita fetchar. Sin esta lista, el
+# CLI rechazará TODAS las peticiones (no se permiten fetches
+# implícitos sin allowlist explícita).
+#
+# Más detalles en sdd/spec.md §2.2 y en el CHANGELOG.
 [fetch]
 default_timeout_seconds = 10
 max_bytes = 5000000
-allowlist = []
+allowlist = ["example.com"]  # <-- reemplaza con tus hosts permitidos
 
 [paths]
 events_jsonl = "~/.local/share/fetch-sentinel/events.jsonl"

@@ -390,3 +390,285 @@ Sin repo remoto creado. Estado congelado, esperando auditor externo.
 
 **Sin push a GitHub. Sin repo remoto creado. Estado congelado, esperando
 auditor externo.**
+
+## Sesión 2026-09-03 (continuación) — T47 + T48 aplicados en local
+
+**Regla de Pedro para esta sesión**: trabajo en local, **sin push** a
+`origin main`. Los commits locales sí; el push queda congelado hasta
+que Claude audite en clon fresco.
+
+**Commit aplicado**: `f57d86a feat(KI-10/11): T47 IP pinning + T48 manual redirect loop, stdlib only`
+
+### Lo que se hizo
+
+Refactor de `core/fetcher.py` para usar `http.client.HTTPConnection` /
+`HTTPSConnection` directamente (en lugar de `urllib.request.urlopen`).
+Stdlib only — cero dependencias nuevas.
+
+- **KI-10 (T47) — Pinning de IP**: `_HttpFetcher._do_request_pinned`
+  resuelve el host una sola vez con `socket.getaddrinfo`, valida la IP
+  contra `_ip_is_blocked`, y abre `socket.create_connection((validated_ip, port))`
+  — NO el hostname. Para HTTPS replica manualmente `wrap_socket` con
+  `server_hostname=self.host` (NO la IP) para que SNI y verificación
+  de certificado TLS usen el hostname original.
+- **KI-11 (T48) — Manual redirect loop**: `fetch()` ejecuta un loop
+  con `DEFAULT_MAX_REDIRECTS=5`. En cada hop valida allowlist cross-host
+  Y `_resolve_and_validate_blocked` ANTES de cualquier conexión. Nueva
+  excepción `RedirectLimitExceeded`.
+
+### Lo que NO se hizo (deliberado)
+
+- ❌ No actualicé `sdd/KNOWN_ISSUES.md` para marcar KI-10/KI-11 como
+  mitigados. Eso lo hace el auditor tras validar en clon fresco. Mi
+  regla de auto-AUDITORÍA: "Sin tocar KNOWN_ISSUES.md hasta que el
+  fix esté realmente verificado por mí mismo con salida cruda
+  (pytest + ruff), igual que siempre." Lo está. Pero la actualización
+  del campo "Estado" de KI-10/KI-11 la reserva el auditor.
+- ❌ No hice push. Regla explícita de Pedro.
+- ❌ No actualicé el post de Dev.to. Si se aprueba el push, el post
+  sigue siendo coherente con la versión anterior (KI-10/KI-11 abiertos).
+  Tras aprobación, el auditor decide si actualizar el post o dejar
+  la versión histórica.
+
+### Verificación adversaria realizada
+
+El auditor me advirtió: "los tests deben ejercitar el CAMINO DE CONEXIÓN
+REAL, no solo la función `_resolve_and_validate_blocked` de forma
+aislada". Para verificar que mis tests lo cumplen, rompí temporalmente
+el pinning (cambié `validated_ip_capture` por `host_capture` en
+`_pinned_connect`) y ejecuté el test:
+
+```
+---TEST CON PINNING ROTO---
+E   KI-10 pinning FALLO: socket.create_connection recibió
+    ('example.com', 80), esperaba la IP validada
+assert ('example.com', 80) == ('93.184.216.34', 80)
+============================== 1 failed in 0.05s ==============================
+```
+
+El test **falla** cuando el pinning está ausente, **pasa** cuando está
+presente. Esto confirma que el test no es un assert vacío: detecta la
+ausencia real del pinning. El fetcher fue restaurado al estado
+committed tras la verificación.
+
+### Estado verificable
+
+- `pytest tests/`: **163 passed in 0.26s** (161 base + 2 nuevos de
+  KI-10/KI-11 que sustituyen a los antiguos).
+- `ruff check .`: All checks passed!
+- `python -m compileall core/ main.py`: limpio.
+- `git log --oneline | head -3`:
+  - `f57d86a feat(KI-10/11): T47 IP pinning + T48 manual redirect loop, stdlib only`
+  - `dde3348 docs+test(KI-12/13): actualizar Estado + tests citation_tracer neutralizado`
+  - `6b20c1f fix(KI-12/13): sha256 sobre cuerpo neutralizado + bypass con espacios`
+- Working tree limpio, sin push, sin repo remoto tocado.
+
+### Lo que el auditor debe verificar mañana
+
+1. `git clone` fresco y ejecución de `pytest tests/`. Esperado: 163 passed.
+2. Revisión del refactor en `core/fetcher.py`:
+   - `_pinned_connect` usa `validated_ip_capture` (no `host_capture`).
+   - HTTPS replica `wrap_socket` con `server_hostname=host_capture`.
+   - `_HttpFetcher.fetch()` loop valida IP de cada hop antes de conectar.
+3. Confirmar que los 4 tests de KI-10/KI-11 son cobertura real (no asserts vacíos):
+   - `test_fetch_pinned_ip_used_in_socket_connect`
+   - `test_fetch_dns_rebinding_two_resolutions`
+   - `test_fetch_redirect_no_connection_to_blocked_target`
+   - `test_fetch_redirect_chain_validates_each_hop`
+   - `test_fetch_redirect_limit_5`
+4. **Si todo está bien**, actualizar `sdd/KNOWN_ISSUES.md` para marcar
+   KI-10 y KI-11 como mitigados. Yo NO lo hice por respeto al flujo de
+   auditoría.
+5. **Si el push se aprueba**, ya está listo (commit limpio, working
+   tree limpio, sin spurios).
+
+
+---
+
+## Fase 11 — KI-14 (T51) y KI-15 (T52): cobertura de gaps en el refactor T47/T48
+
+**Fecha**: 2026-09-03 (3ª ronda de auditoría de Claude)
+
+### KI-14 — Validación de scheme en CADA salto de redirect (T51)
+
+**Bug**: `_validate_scheme()` solo se llamaba sobre la URL inicial. Un
+redirect a `gopher://public.example.com:6379/` pasaba sin queja y
+`_do_request_pinned()` lo trataba como HTTP plano, conectando
+realmente al puerto 6379 de un host público. Vector de SSRF a puerto
+arbitrario en hosts ya autorizados.
+
+**Fix** (`core/fetcher.py` línea 340): añadir
+`self._validate_scheme(new_url)` en el bucle de redirects, ANTES de
+la validación de allowlist. Si el scheme es inválido, no tiene
+sentido chequear allowlist ni DNS.
+
+**Tests añadidos** (6 nuevos en `tests/test_fetcher.py`):
+
+1. `test_fetch_redirect_to_gopher_scheme_blocked` — reproducción
+   literal del payload del auditor.
+2. `test_fetch_redirect_to_ftp_scheme_blocked` — ftp://
+3. `test_fetch_redirect_to_file_scheme_blocked` — file:///etc/passwd
+4. `test_fetch_redirect_to_javascript_scheme_blocked` — javascript:alert(1)
+5. `test_fetch_redirect_https_to_gopher_blocked` — https:// → gopher://
+6. `test_fetch_redirect_blocked_by_scheme_validates_first` — orden
+   scheme → allowlist → IP (getaddrinfo NO debe llamarse para el
+   destino bloqueado por scheme).
+
+**Verificación adversaria**: romper el check de scheme y comprobar
+que los 6 tests fallan → CONFIRMADO, 6 fallan con `pass` en lugar
+de `self._validate_scheme(new_url)`. Restaurar, vuelven a pasar.
+
+### KI-15 — Cobertura HTTPS/TLS (T52)
+
+**Bug**: la rama HTTPS de `_pinned_connect()` (ctx.wrap_socket con
+server_hostname=host) estaba completamente sin tests. Si alguien
+futuro cambiase `host_capture` por `validated_ip_capture`, la
+verificación de certificado TLS se rompería en silencio (SNI con la
+IP en vez del hostname → cert no valida hostname).
+
+**Fix**:
+- `core/fetcher.py`: mover `import ssl` a nivel de módulo (era
+  local en `_pinned_connect`; ahora testeable).
+- `tests/test_fetcher.py`: helper `patch_tls_for_https(monkeypatch)`
+  que mockea `ssl.SSLContext.wrap_socket` y captura `server_hostname`.
+
+**Tests añadidos** (4 nuevos):
+
+1. `test_fetch_https_pinned_uses_hostname_in_tls` — server_hostname
+   == "example.com" (hostname), NO la IP.
+2. `test_fetch_https_pinned_does_not_use_ip_in_tls` — variante
+   explícita: server_hostname != IP validada.
+3. `test_fetch_https_uses_default_ssl_context` — el context es
+   `ssl.SSLContext` con `verify_mode != CERT_NONE` y
+   `check_hostname == True` (defensa en profundidad: incluso si
+   SNI se rompe, la verificación sigue activa).
+4. `test_fetch_https_adversarial_server_hostname_equals_ip` —
+   test adversarial: si el código pasara la IP a wrap_socket, este
+   test fallaría con un mensaje explícito.
+
+**Verificación adversaria**: cambiar `server_hostname=host_capture`
+por `server_hostname=validated_ip_capture` → CONFIRMADO, 3 de los
+4 tests fallan (el cuarto verifica la clase del context, no
+`server_hostname` — es defensa en profundidad, ortogonal a la
+adversarial concreta).
+
+### KI-10/KI-11 — Estados actualizados
+
+- KI-10 (T47) → **mitigado en `9878e9b`**. Estado refleja realidad.
+- KI-11 (T48) → **mitigado en `9878e9b`**. Estado refleja realidad.
+- Imprecisión de doc del bucle (T53) → corregido en este commit.
+  El check `_resolve_and_validate_blocked()` en el bucle es
+  redundante con el interno de `_do_request_pinned()`; queda
+  documentado en el código.
+
+### Total
+
+- **173 tests verde** (10 nuevos: 6 T51 + 4 T52).
+- **ruff clean**.
+- **py_compile clean**.
+- 4 archivos modificados, 558 líneas añadidas, 3 eliminadas.
+
+---
+
+## Fase 12 — KI-7 residual: allowlist vacío = fail-closed (2026-09-04)
+
+**Decisión**: cambio de default del CLI, no fix de bug. Antes
+`--allowlist` ausente o `[]` significaba "sin restricción" (el fetcher
+aceptaba CUALQUIER URL). Ahora significa "fail-closed" (rechaza con
+`FetchError("allowlist is empty")` y `rc=2`). Coherente con la
+postura "seguro por defecto" del resto del proyecto (SSRF block,
+structural guard, witness client).
+
+### Cambios aplicados
+
+**`core/fetcher.py`**:
+
+1. `_validate_scheme` se refactoriza como **función libre de módulo**
+   `validate_scheme(url)` (decisión clave que arregló el intento
+   fallido anterior). El método `_HttpFetcher._validate_scheme`
+   queda como `@staticmethod` que delega a la función libre,
+   manteniendo las 2 llamadas internas (`self._validate_scheme(url)`
+   en `fetch()` y en el bucle de redirects) sin cambios.
+
+2. `_check_allowlist`: `None` o `[]` ahora raise `FetchError` con
+   mensaje que apunta a `--allowlist`, `config.toml`, y al CHANGELOG.
+   Cambio de comportamiento documentado en el docstring.
+
+3. `_validate_redirect`: mismo fail-closed (`if not self.allowlist:
+   raise RedirectNotAllowed`). Documentado como defensa en
+   profundidad — inalcanzable vía `fetch()` público porque
+   `_check_allowlist` corta antes, pero el método debe seguir
+   siendo seguro si se llama directamente (mismo patrón que T53
+   para KI-11).
+
+4. `fetch()` público: reordenado a **scheme → allowlist → IP**
+   (antes era allowlist → scheme). El check de scheme primero
+   permite que URLs con scheme no soportado (`file://`,
+   `javascript:`) se rechacen limpiamente sin tener que evaluar
+   una allowlist sin host parseable.
+
+**`main.py`**:
+
+5. `allowlist=args.allowlist` (antes `or None` que convertía lista
+   vacía en `None` = "sin restricción"). Ahora vacío se mantiene
+   vacío y se delega la decisión a `_check_allowlist`.
+
+**`config.toml`** (en el repo):
+
+6. `allowlist = []` reemplazado por `allowlist = ["example.com"]`
+   (un ejemplo razonable) con un comentario prominente en la
+   cabecera del archivo explicando KI-7 residual y apuntando al
+   CHANGELOG. Sin esto, el `config.toml` por defecto del repo
+   rechazaba TODO con la nueva semántica fail-closed.
+
+### Tests añadidos / actualizados
+
+- 25 llamadas `fetch(...)` en `test_fetcher.py` actualizadas con
+  `allowlist=[<host>]` extraído de la URL (script con
+  bracket-matching que soporta multilínea).
+- 8 llamadas `main([...])` en `test_main.py` actualizadas con
+  `--allowlist example.com`.
+- 1 test eliminado: `test_check_allowlist_none_allows_all`
+  (probaba el comportamiento viejo).
+- 3 tests nuevos del fail-closed:
+  - `test_check_allowlist_none_rejects`
+  - `test_check_allowlist_empty_list_rejects`
+  - `test_check_allowlist_none_and_empty_same_behavior`
+- 4 tests nuevos de `_validate_redirect` directo (defensa en
+  profundidad, inalcanzable vía `fetch()` público).
+
+**Total: 200 tests verde** (de 194 antes de este commit).
+
+### Verificación adversaria
+
+Dos scripts ad-hoc:
+
+1. **Romper `_check_allowlist`** (reemplazar el bloque fail-closed
+   por `pass`): los 3 tests del fail-closed fallan. Restaurado,
+   vuelven a pasar.
+2. **Romper `_validate_redirect`** (reemplazar el bloque fail-closed
+   por `pass`): `test_validate_redirect_empty_allowlist_rejects`
+   falla con `TypeError: 'NoneType' object is not iterable` (en el
+   `for pattern in self.allowlist` posterior). El test detecta la
+   ausencia del check, no es assert vacío.
+
+### Smoke test del CLI (rc verificado)
+
+- **Sin config.toml, sin --allowlist**: `rc=2`, mensaje "allowlist
+  is empty", fail-closed funcional.
+- **Con config.toml poblado (`allowlist = ["example.com"]`)**:
+  `rc=0`, fetch exitoso.
+- **Con `--allowlist example.com` en CLI (sin config.toml)**:
+  `rc=0`, fetch exitoso.
+
+### Documentación actualizada
+
+- **`CHANGELOG.md`** (nuevo archivo en el repo): sección
+  `[Unreleased]` con `⚠️ BREAKING CHANGES` describiendo KI-7
+  residual, SEC-07, SEC-04, SEC-05. Cada cambio tiene "Por qué",
+  "Cómo adaptarse" (donde aplica), y referencia a la spec.
+- **`sdd/spec.md §2.2`**: fila de `allowlist` actualizada para
+  reflejar el nuevo default fail-closed.
+- **`sdd/KNOWN_ISSUES.md`**: KI-7 marcado como completamente
+  cerrado en este commit, con resumen de los KI relacionados
+  (10/11/12/13/14/15 también cerrados).

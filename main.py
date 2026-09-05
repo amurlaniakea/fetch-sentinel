@@ -15,6 +15,9 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from pathlib import Path
+
+import tomllib
 
 from core import citation_tracer as ct
 from core import exceptions
@@ -30,6 +33,93 @@ _EXIT_FETCH = 2
 _EXIT_GUARD = 3
 _EXIT_WITNESS = 4
 _EXIT_SANDBOX = 5
+
+
+def _load_config_toml(config_path: Path = Path("config.toml")) -> dict:
+    """Lee config.toml si existe. Devuelve dict vacío si no existe.
+
+    SEC-05 (config.toml fantasma, Gemini 2026-09-03): antes, este
+    archivo existía en el repo pero main.py no lo cargaba nunca. Un
+    operador que desplegaba asumiendo que sus ajustes se aplicaban
+    estaba fallando en silencio. Ahora se lee, se intenta aplicar,
+    y se emite warning explícito de cualquier ajuste que no se pueda
+    aplicar por esta vía (porque CLI manda, o porque la sección no
+    está cableada al runtime actual).
+    """
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path, "rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        print(
+            f"warning: config.toml existe pero tiene TOML inválido: {e}. "
+            f"Usando defaults del CLI.",
+            file=sys.stderr,
+        )
+        return {}
+    return data
+
+
+def _warn_unapplied_config_keys(config: dict) -> None:
+    """SEC-05: lista las claves de config.toml que se encontraron pero
+    NO se aplican al runtime actual. Sin este aviso, un operador que
+    pone `events_jsonl = "/otro/path/events.jsonl"` no se entera de
+    que el path no se está usando hasta que vea que el archivo se
+    sigue creando en el path por defecto.
+    """
+    # Mapeo seccion → set de claves aplicadas (referencia para el loop).
+    section_applied: dict[str, set[str]] = {
+        "fetch": {"default_timeout_seconds", "max_bytes", "allowlist"},
+    }
+    warnings: list[str] = []
+    for section, body in config.items():
+        if not isinstance(body, dict):
+            warnings.append(f"sección [{section}] no es una tabla TOML")
+            continue
+        known = section_applied.get(section, set())
+        for key in body:
+            if key in known:
+                continue
+            warnings.append(f"[{section}].{key}")
+    if warnings:
+        print(
+            f"warning: config.toml contiene claves que esta versión "
+            f"de fetch-sentinel NO aplica al runtime: {', '.join(warnings)}. "
+            f"Revisa sdd/spec.md §9 o actualiza fetch-sentinel.",
+            file=sys.stderr,
+        )
+
+
+def _apply_config_to_args(args: argparse.Namespace, config: dict) -> None:
+    """SEC-05: aplica config.toml como defaults subordinados a CLI.
+
+    Regla: CLI siempre manda. Si el usuario pasa --timeout, ese valor
+    se usa aunque config.toml diga otro. Si el usuario NO pasa el flag,
+    el valor de config.toml se aplica. Si config.toml tampoco lo
+    define, se mantiene el default del parser.
+    """
+    # argparse con default=None detecta "no se pasó el flag".
+    fetch_cfg = config.get("fetch", {})
+    if args.timeout == 10.0 and "default_timeout_seconds" in fetch_cfg:
+        # 10.0 es el default del parser — si el usuario no lo cambió,
+        # se puede aplicar config.toml.
+        args.timeout = float(fetch_cfg["default_timeout_seconds"])
+    if args.max_bytes == 5_000_000 and "max_bytes" in fetch_cfg:
+        args.max_bytes = int(fetch_cfg["max_bytes"])
+    # Para --allowlist, el default del parser es [] y `action="append"`
+    # hace que cualquier paso por CLI lo llene. Si está vacío, significa
+    # que el usuario no pasó --allowlist, así que aplicamos config.
+    if not args.allowlist and "allowlist" in fetch_cfg:
+        al = fetch_cfg["allowlist"]
+        if isinstance(al, list):
+            args.allowlist = [str(x) for x in al]
+        else:
+            print(
+                "warning: config.toml [fetch].allowlist no es una lista; "
+                "ignorado.",
+                file=sys.stderr,
+            )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -63,11 +153,16 @@ def _cmd_fetch(args: argparse.Namespace) -> int:
     sb.assert_safe_environment()
 
     # Capa 1 — fetch.
+    # KI-7 residual: pasar args.allowlist directamente (lista vacía si
+    # el usuario no pasó --allowlist). Antes era 'or None' que convertía
+    # la lista vacía en None = "sin restricción". Ahora vacío = fail-closed
+    # (rechaza, "ningún host permitido"). Cambio de comportamiento del
+    # default del CLI documentado en CHANGELOG.
     fetch_result = ft.fetch(
         args.url,
         timeout=args.timeout,
         max_bytes=args.max_bytes,
-        allowlist=args.allowlist or None,
+        allowlist=args.allowlist,
     )
 
     # Capa 4.1 — witness: registrar tool_call.
@@ -136,6 +231,13 @@ def _cmd_fetch(args: argparse.Namespace) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    # SEC-05: leer config.toml antes de dispatch, aplicar como defaults
+    # subordinados a CLI, y avisar de cualquier clave no aplicable.
+    config = _load_config_toml()
+    if config:
+        _warn_unapplied_config_keys(config)
+        _apply_config_to_args(args, config)
 
     try:
         if args.command == "fetch":

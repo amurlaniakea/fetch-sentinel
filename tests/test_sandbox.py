@@ -189,3 +189,86 @@ def test_patrón_i_paths_leídos_en_cada_llamada(
     new_home.mkdir()
     monkeypatch.setenv("HOME", str(new_home))
     assert is_writable(target) is False
+
+# --------------------------------------------------------------------------- #
+# SEC-04 — Warning explícito a stderr en assert_safe_environment
+# --------------------------------------------------------------------------- #
+
+
+def test_assert_safe_environment_warns_on_openai_key(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SEC-04: si OPENAI_API_KEY está en os.environ al llamar a
+    assert_safe_environment(), debe emitirse un warning a stderr.
+    Antes: pass silencioso.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test1234567890")
+    # HOME ya está seteada en conftest (fake_home fixture si la hay,
+    # o el HOME del test runner).
+    assert_safe_environment()
+    captured = capsys.readouterr()
+    assert "OPENAI_API_KEY" in captured.err
+    assert "warning" in captured.err.lower()
+
+
+def test_assert_safe_environment_warns_on_anthropic_key(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SEC-04: ANTHROPIC_API_KEY también dispara warning."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    assert_safe_environment()
+    captured = capsys.readouterr()
+    assert "ANTHROPIC_API_KEY" in captured.err
+
+
+def test_assert_safe_environment_warns_on_atw_witness_key(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SEC-04: ATW_WITNESS_KEY (la del agente principal, no la nuestra)
+    también dispara warning."""
+    monkeypatch.setenv("ATW_WITNESS_KEY", "test-key")
+    assert_safe_environment()
+    captured = capsys.readouterr()
+    assert "ATW_WITNESS_KEY" in captured.err
+
+
+def test_assert_safe_environment_warns_on_multiple_keys(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SEC-04: múltiples keys en una sola llamada → un solo warning que
+    lista todas."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test2")
+    monkeypatch.setenv("ATW_WITNESS_KEY", "sk-test3")
+    assert_safe_environment()
+    captured = capsys.readouterr()
+    assert "OPENAI_API_KEY" in captured.err
+    assert "ANTHROPIC_API_KEY" in captured.err
+    assert "ATW_WITNESS_KEY" in captured.err
+
+
+def test_assert_safe_environment_silent_when_no_suspicious_vars(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SEC-04: sin vars sospechosas, NO se emite warning (no spam)."""
+    # Quitamos cualquier var sospechosa que pueda estar en el entorno
+    # de test.
+    for v in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "ATW_WITNESS_KEY"):
+        monkeypatch.delenv(v, raising=False)
+    assert_safe_environment()
+    captured = capsys.readouterr()
+    assert captured.err == "", (
+        f"Sin vars sospechosas, assert_safe_environment NO debe "
+        f"escribir a stderr, pero escribió: {captured.err!r}"
+    )
+
+
+def test_assert_safe_environment_does_not_raise_on_suspicious_vars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC-04: el warning es informativo, NO aborta la ejecución.
+    Purgar os.environ como proponía Gemini rompería imports legítimos
+    (HOME, PATH, etc. los necesitan las dependencias)."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    # No debe raise.
+    assert_safe_environment()

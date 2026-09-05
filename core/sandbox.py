@@ -24,6 +24,7 @@ import-time y rompe monkeypatch).
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from core.exceptions import SandboxError
@@ -130,16 +131,27 @@ def assert_safe_environment() -> None:
         raise SandboxError("HOME not set; cannot resolve write allowlist")
 
     # Aviso (no error) si hay vars que no debemos usar.
+    # SEC-04 (sandbox inerte, Gemini 2026-09-03): el código anterior
+    # tenía `pass` silencioso. La postura defensiva es: si el proceso
+    # fetch-sentinel se inicia con vars de API key del agente principal
+    # en os.environ, eso es señal de que el llamante no respetó la
+    # separación de privilegios. NO abortamos (eso rompería imports
+    # legítimos de las dependencias que sí usan HOME/PATH), pero
+    # emitimos un warning explícito a stderr para que un operador
+    # detecte la mala configuración en logs/ci.
     suspicious_vars = [
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "GOOGLE_API_KEY",
         "ATW_WITNESS_KEY",  # el del agente principal, no el nuestro
     ]
-    for v in suspicious_vars:
-        if v in os.environ:
-            # NO raise — solo informativo. El proceso fetch-sentinel no
-            # va a usar esas vars porque no están en allowed_env(). Pero
-            # si llegan aquí, es señal de que el llamante no respetó la
-            # separación. Por ahora, silencioso.
-            pass
+    found = [v for v in suspicious_vars if v in os.environ]
+    if found:
+        print(
+            f"warning: fetch-sentinel detecta vars de entorno del "
+            f"agente principal en os.environ: {', '.join(found)}. "
+            f"fetch-sentinel NO las usará (no están en allowed_env()), "
+            f"pero esto indica que el llamante no respetó la "
+            f"separación de privilegios de Capa 3.",
+            file=sys.stderr,
+        )

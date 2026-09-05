@@ -69,7 +69,7 @@ def fetch(url: str, *, timeout: float = 10.0,
 | `url` | `str` | — | Obligatorio. Solo `http://` o `https://`. |
 | `timeout` | `float` | `10.0` | Segundos. Aplica a connect + read. |
 | `max_bytes` | `int` | `5_000_000` | Tope duro del cuerpo. Si excede, `FetchError.SizeExceeded`. |
-| `allowlist` | `list[str]` | `None` | Si se da, la URL debe matchear al menos un patrón (sufijo DNS). Si `None`, no hay allowlist. |
+| `allowlist` | `list[str]` | `[]` (fail-closed) | Lista de patrones DNS (sufijo). La URL Y cualquier redirect cross-origin deben matchear al menos un patrón. **`None` y `[]` se consideran fail-closed (rechaza) desde v0.2** — KI-7 residual, decisión 2026-09-04. Antes `None` significaba "sin restricción"; ahora hay que poblar la lista explícitamente. |
 
 ### §2.3 Contrato de salida
 
